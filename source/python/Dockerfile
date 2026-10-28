@@ -1,7 +1,9 @@
-FROM python:3.13.7-alpine3.21
+FROM python:3.10-slim
 
 WORKDIR /app
 
-RUN pip install pyzmq
+RUN pip install --no-cache-dir pyzmq
 
-CMD ["python", "main.py"]
+COPY broker.py cliente.py servidor.py ./
+
+CMD ["python", "broker.py"]
