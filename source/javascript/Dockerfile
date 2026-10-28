@@ -14,4 +14,4 @@ RUN npm install
 COPY . /app
 
 # Comando para rodar o cliente JS
-CMD ["node", "client.js"]
+CMD ["node", "server.js"]
