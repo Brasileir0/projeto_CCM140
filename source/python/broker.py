@@ -1,38 +1,24 @@
 import zmq
 
-context = zmq.Context()
-poller = zmq.Poller()
+def main():
+    context = zmq.Context()
+    
+    cliente_socket = context.socket(zmq.ROUTER)
+    cliente_socket.bind("tcp://*:5555")
+    
+    servidor_socket = context.socket(zmq.DEALER)
+    servidor_socket.bind("tcp://*:5556")
+    
+    print("Broker iniciado. Aguardando conexões...")
 
-client_socket = context.socket(zmq.ROUTER)
-client_socket.bind("tcp://*:5555")
-poller.register(client_socket, zmq.POLLIN)
-client_count = 0
+    try:
+        zmq.proxy(cliente_socket, servidor_socket)
+    except KeyboardInterrupt:
+        print("Broker encerrado.")
+    finally:
+        cliente_socket.close()
+        servidor_socket.close()
+        context.term()
 
-server_socket = context.socket(zmq.DEALER)
-server_socket.bind("tcp://*:5556")
-poller.register(server_socket, zmq.POLLIN)
-server_count = 0
-
-while True:
-    socks = dict(poller.poll())
-
-    if socks.get(client_socket) == zmq.POLLIN:
-        client_count += 1
-        message = client_socket.recv()
-        more = client_socket.getsockopt(zmq.RCVMORE)
-        if more:
-            server_socket.send(message, zmq.SNDMORE)
-        else:
-            server_socket.send(message)
-        print(f"Client messages: {client_count}", flush=True)
-
-    if socks.get(server_socket) == zmq.POLLIN:
-        server_count += 1
-        message = server_socket.recv()
-        more = server_socket.getsockopt(zmq.RCVMORE)
-        if more:
-            client_socket.send(message, zmq.SNDMORE)
-        else:
-            client_socket.send(message)
-        print(f"Server messages: {server_count}", flush=True)
-
+if __name__ == "__main__":
+    main()
