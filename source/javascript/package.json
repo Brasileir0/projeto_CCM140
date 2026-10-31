@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start:client": "node client.js",
-    "start:server": "node server.js"
+    "start:server": "node server.js",
+    "start:broker": "node broker.js"
   },
   "dependencies": {
     "msgpack5": "^6.0.2",

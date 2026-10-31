@@ -3,8 +3,10 @@ const msgpack = require('msgpack5')();
 const fs = require('fs');
 const path = require('path');
 
-const USERS_FILE = path.join(__dirname, 'users.txt');
-const CHANNELS_FILE = path.join(__dirname, 'channels.txt');
+const DATA_DIR = path.join(__dirname, 'data');
+const USERS_FILE = path.join(DATA_DIR, 'users.txt');
+const CHANNELS_FILE = path.join(DATA_DIR, 'channels.txt');
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function getTimestamp() {
     const now = new Date();
@@ -53,42 +55,55 @@ async function main() {
 
     for await (const [requestBuffer] of sock) {
         const reqMap = msgpack.decode(requestBuffer);
-
         const action = reqMap.action;
-        const timestamp = getTimestamp();
+        const requestTimestamp = reqMap.timestamp;
         let repMap = {};
 
-        if (action === 'login') {
-            const username = reqMap.username;
-            saveUser(username, timestamp);
-            console.log(`[${timestamp}][LOGIN] Usuário: ${username}`);
-            repMap.status = 'success';
-            repMap.message = 'Login realizado com sucesso';
-        } 
-        else if (action === 'create_channel') {
-            const channel = reqMap.channel;
+        if (typeof requestTimestamp !== 'string' || requestTimestamp.trim() === '') {
+            repMap.status = 'error';
+            repMap.message = 'Timestamp ausente';
+            console.log(`[${getTimestamp()}][ERRO] Timestamp ausente`);
+        } else if (action === 'login') {
+            const username = typeof reqMap.username === 'string' ? reqMap.username.trim() : '';
+            if (username === '') {
+                repMap.status = 'error';
+                repMap.message = 'Nome de usuário inválido';
+                console.log(`[${requestTimestamp}][LOGIN ERRO] Nome inválido`);
+            } else {
+                saveUser(username, requestTimestamp);
+                console.log(`[${requestTimestamp}][LOGIN] Usuário: ${username}`);
+                repMap.status = 'success';
+                repMap.message = 'Login realizado com sucesso';
+            }
+        } else if (action === 'create_channel') {
+            const channel = typeof reqMap.channel === 'string' ? reqMap.channel.trim() : '';
             const channels = loadChannels();
-            
-            if (!channels.has(channel)) {
+
+            if (channel === '') {
+                repMap.status = 'error';
+                repMap.message = 'Nome de canal inválido';
+                console.log(`[${requestTimestamp}][CANAL ERRO] Nome inválido`);
+            } else if (!channels.has(channel)) {
                 saveChannel(channel);
-                console.log(`[${timestamp}][CHANNEL] Canal criado: ${channel}`);
+                console.log(`[${requestTimestamp}][CHANNEL] Canal criado: ${channel}`);
                 repMap.status = 'success';
                 repMap.message = 'Canal criado com sucesso';
             } else {
                 repMap.status = 'error';
                 repMap.message = 'Canal já existe';
+                console.log(`[${requestTimestamp}][CANAL ERRO] Já existe: ${channel}`);
             }
-        } 
-        else if (action === 'list_channels') {
-            const channels = loadChannels();
-            let channelList = '';
-            for (const ch of channels) {
-                channelList += ch + ';';
-            }
+        } else if (action === 'list_channels') {
             repMap.status = 'success';
-            repMap.channels = channelList;
+            repMap.channels = Array.from(loadChannels()).sort().join(';');
+            console.log(`[${requestTimestamp}][CANAIS] Lista enviada: ${repMap.channels}`);
+        } else {
+            repMap.status = 'error';
+            repMap.message = 'Ação desconhecida';
+            console.log(`[${requestTimestamp}][ERRO] Ação desconhecida: ${action}`);
         }
 
+        repMap.timestamp = getTimestamp();
         const replyBuffer = msgpack.encode(repMap);
         await sock.send(replyBuffer);
     }

@@ -4,6 +4,8 @@
 #include <chrono>
 #include <iomanip>
 #include <set>
+#include <ctime>
+#include <filesystem>
 #include <zmq.hpp>
 #include <msgpack.hpp>
 #include <map>
@@ -11,24 +13,33 @@
 std::string get_timestamp() {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time{};
+    localtime_r(&in_time_t, &local_time);
     std::stringstream ss;
-    ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %X");
+    ss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S");
     return ss.str();
 }
 
+std::string trim(const std::string& value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
 void save_user(const std::string& username, const std::string& timestamp) {
-    std::ofstream file("users.txt", std::ios::app);
+    std::ofstream file("data/users.txt", std::ios::app);
     file << username << "," << timestamp << "\n";
 }
 
 void save_channel(const std::string& channel) {
-    std::ofstream file ("channels.txt", std::ios::app);
+    std::ofstream file("data/channels.txt", std::ios::app);
     file << channel << "\n";
 }
 
 std::set<std::string> load_channels() {
     std::set<std::string> channels;
-    std::ifstream file ("channels.txt");
+    std::ifstream file("data/channels.txt");
     std::string line;
     while (std::getline(file, line)) {
         if (!line.empty()) channels.insert(line);
@@ -37,6 +48,7 @@ std::set<std::string> load_channels() {
 }
 
 int main() {
+    std::filesystem::create_directories("data");
     zmq::context_t context(1);
     zmq::socket_t socket(context, zmq::socket_type::rep);
     socket.bind("tcp://*:5555");
@@ -53,38 +65,63 @@ int main() {
         obj.convert(req_map);
 
         std::string action = req_map["action"];
-        std::string timestamp = get_timestamp();
+        std::string request_timestamp = req_map["timestamp"];
         std::map<std::string, std::string> rep_map;
 
-        if (action == "login") {
-            std::string username = req_map["username"];
-            save_user(username, timestamp);
-            std::cout << "[" << timestamp << "][LOGIN] Usuário: " << username << "\n";
-            rep_map["status"] = "success";
-            rep_map["message"] = "Login realizado com sucesso";
+        if (request_timestamp.empty()) {
+            rep_map["status"] = "error";
+            rep_map["message"] = "Timestamp ausente";
+            std::cout << "[" << get_timestamp() << "][ERRO] Timestamp ausente" << std::endl;
+        }
+        else if (action == "login") {
+            std::string username = trim(req_map["username"]);
+            if (username.empty()) {
+                rep_map["status"] = "error";
+                rep_map["message"] = "Nome de usuário inválido";
+                std::cout << "[" << request_timestamp << "][LOGIN ERRO] Nome inválido" << std::endl;
+            } else {
+                save_user(username, request_timestamp);
+                std::cout << "[" << request_timestamp << "][LOGIN] Usuário: " << username << "\n";
+                rep_map["status"] = "success";
+                rep_map["message"] = "Login realizado com sucesso";
+            }
         }
         else if (action == "create_channel") {
-            std::string channel = req_map["channel"];
+            std::string channel = trim(req_map["channel"]);
             auto channels = load_channels();
-            if (channels.find(channel) == channels.end()) {
+            if (channel.empty()) {
+                rep_map["status"] = "error";
+                rep_map["message"] = "Nome de canal inválido";
+                std::cout << "[" << request_timestamp << "][CANAL ERRO] Nome inválido" << std::endl;
+            } else if (channels.find(channel) == channels.end()) {
                 save_channel(channel);
-                std::cout << "[" << timestamp << "][CHANNEL] Canal criado: " << channel << "\n"; 
+                std::cout << "[" << request_timestamp << "][CHANNEL] Canal criado: " << channel << "\n";
                 rep_map["status"] = "success";
                 rep_map["message"] = "Canal criado com sucesso";
             } else {
                 rep_map["status"] = "error";
                 rep_map["message"] = "Canal já existe";
+                std::cout << "[" << request_timestamp << "][CANAL ERRO] Já existe: " << channel << std::endl;
             }
         }
         else if (action == "list_channels") {
             auto channels = load_channels();
-            std::string channel_list = "";
-            for (const auto& ch : channels) {
-                channel_list += ch + ";";
+            std::string channel_list;
+            for (const auto& channel : channels) {
+                if (!channel_list.empty()) channel_list += ";";
+                channel_list += channel;
             }
             rep_map["status"] = "success";
             rep_map["channels"] = channel_list;
+            std::cout << "[" << request_timestamp << "][CANAIS] Lista enviada: " << channel_list << std::endl;
         }
+        else {
+            rep_map["status"] = "error";
+            rep_map["message"] = "Ação desconhecida";
+            std::cout << "[" << request_timestamp << "][ERRO] Ação desconhecida: " << action << std::endl;
+        }
+
+        rep_map["timestamp"] = get_timestamp();
 
         msgpack::sbuffer sbuf;
         msgpack::pack(sbuf, rep_map);

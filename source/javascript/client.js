@@ -3,48 +3,50 @@ const msgpack = require('msgpack5')();
 
 function getTimestamp() {
     const now = new Date();
-    const pad = (n) => String(n).padStart(2, '0');
-
+    const pad = (value) => String(value).padStart(2, '0');
     return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ` +
         `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
 }
 
-async function sendRequest(socket, requestData) {
-    await socket.send(msgpack.encode(requestData));
+async function sendRequest(socket, requestData, responseField) {
+    const timestamp = getTimestamp();
+    const request = { ...requestData, timestamp };
+    console.log(`[${timestamp}][REQ] ${request.action}`);
+    await socket.send(msgpack.encode(request));
     const [replyBuffer] = await socket.receive();
-    return msgpack.decode(replyBuffer);
+    const response = msgpack.decode(replyBuffer);
+    console.log(`[${timestamp}][REP] ${response[responseField] || ''}`);
+    return response;
 }
 
 async function main() {
-    const socket = new zmq.Request();
-    socket.connect('tcp://server-javascript:5555');
-    const timestamp = getTimestamp();
+    const endpoints = (process.env.SERVER_ENDPOINTS || 'tcp://server-javascript:5555')
+        .split(',')
+        .map((endpoint) => endpoint.trim())
+        .filter(Boolean);
 
-    try {
-        const login = await sendRequest(socket, {
-            action: 'login',
-            username: 'JAVASCRIPT',
-            timestamp
-        });
-        console.log(`[${timestamp}][LOGIN RESP] ${login.message || ''}`);
+    for (const endpoint of endpoints) {
+        console.log(`[Cliente JS] Conectando a ${endpoint}`);
+        const socket = new zmq.Request();
+        socket.connect(endpoint);
 
-        const channel = await sendRequest(socket, {
-            action: 'create_channel',
-            channel: 'geral',
-            timestamp
-        });
-        console.log(`[${timestamp}][CHANNEL RESP] ${channel.message || ''}`);
+        try {
+            const loginRequest = { action: 'login', username: 'JAVASCRIPT' };
+            let login = await sendRequest(socket, loginRequest, 'message');
+            while (login.status !== 'success') {
+                await new Promise((resolve) => setTimeout(resolve, 1000));
+                login = await sendRequest(socket, loginRequest, 'message');
+            }
 
-        const channels = await sendRequest(socket, {
-            action: 'list_channels',
-            timestamp
-        });
-        console.log(`[${timestamp}][CANAIS] ${channels.channels || ''}`);
-    } catch (error) {
-        console.error('Erro na comunicação:', error);
-        process.exitCode = 1;
-    } finally {
-        await socket.close();
+            await sendRequest(
+                socket,
+                { action: 'create_channel', channel: 'geral' },
+                'message'
+            );
+            await sendRequest(socket, { action: 'list_channels' }, 'channels');
+        } finally {
+            await socket.close();
+        }
     }
 }
 
