@@ -1,42 +1,152 @@
 services:
-  server-python:
+  server-python-1:
     build:
       context: ./python
       dockerfile: Dockerfile
     command: ["python", "server.py"]
+    restart: unless-stopped
+    volumes:
+      - server_python_1_data:/app/data
 
-  client-python:
+  server-python-2:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    command: ["python", "server.py"]
+    restart: unless-stopped
+    volumes:
+      - server_python_2_data:/app/data
+
+  client-python-1:
     build:
       context: ./python
       dockerfile: Dockerfile
     command: ["python", "client.py"]
+    environment:
+      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
     depends_on:
-      - server-python
+      - server-python-1
+      - server-python-2
+      - server-javascript-1
+      - server-javascript-2
+      - server-cpp-1
+      - server-cpp-2
 
-  server-javascript:
+  client-python-2:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    command: ["python", "client.py"]
+    environment:
+      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
+    depends_on:
+      - server-python-1
+      - server-python-2
+      - server-javascript-1
+      - server-javascript-2
+      - server-cpp-1
+      - server-cpp-2
+
+  server-javascript-1:
     build:
       context: ./javascript
       dockerfile: Dockerfile
     command: ["node", "server.js"]
+    restart: unless-stopped
+    volumes:
+      - server_javascript_1_data:/app/data
 
-  client-javascript:
+  server-javascript-2:
+    build:
+      context: ./javascript
+      dockerfile: Dockerfile
+    command: ["node", "server.js"]
+    restart: unless-stopped
+    volumes:
+      - server_javascript_2_data:/app/data
+
+  client-javascript-1:
     build:
       context: ./javascript
       dockerfile: Dockerfile
     command: ["node", "client.js"]
+    environment:
+      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
     depends_on:
-      - server-javascript
+      - server-python-1
+      - server-python-2
+      - server-javascript-1
+      - server-javascript-2
+      - server-cpp-1
+      - server-cpp-2
 
-  server-cpp:
+  client-javascript-2:
+    build:
+      context: ./javascript
+      dockerfile: Dockerfile
+    command: ["node", "client.js"]
+    environment:
+      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
+    depends_on:
+      - server-python-1
+      - server-python-2
+      - server-javascript-1
+      - server-javascript-2
+      - server-cpp-1
+      - server-cpp-2
+
+  server-cpp-1:
     build:
       context: ./cpp
       dockerfile: Dockerfile
     command: ["./build/server"]
+    restart: unless-stopped
+    volumes:
+      - server_cpp_1_data:/app/data
 
-  client-cpp:
+  server-cpp-2:
+    build:
+      context: ./cpp
+      dockerfile: Dockerfile
+    command: ["./build/server"]
+    restart: unless-stopped
+    volumes:
+      - server_cpp_2_data:/app/data
+
+  client-cpp-1:
     build:
       context: ./cpp
       dockerfile: Dockerfile
     command: ["./build/client"]
+    environment:
+      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
     depends_on:
-      - server-cpp
+      - server-python-1
+      - server-python-2
+      - server-javascript-1
+      - server-javascript-2
+      - server-cpp-1
+      - server-cpp-2
+
+  client-cpp-2:
+    build:
+      context: ./cpp
+      dockerfile: Dockerfile
+    command: ["./build/client"]
+    environment:
+      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
+    depends_on:
+      - server-python-1
+      - server-python-2
+      - server-javascript-1
+      - server-javascript-2
+      - server-cpp-1
+      - server-cpp-2
+
+volumes:
+  server_python_1_data:
+  server_python_2_data:
+  server_javascript_1_data:
+  server_javascript_2_data:
+  server_cpp_1_data:
+  server_cpp_2_data:

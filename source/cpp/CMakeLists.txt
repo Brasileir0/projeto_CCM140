@@ -3,12 +3,14 @@ project(bbs_project)
 
 set(CMAKE_CXX_STANDARD 17)
 
-find_package(ZeroMQ REQUIRED)
-find_package(cppzmq REQUIRED)
-find_package(msgpack-cxx REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ZeroMQ REQUIRED IMPORTED_TARGET libzmq)
 
 add_executable(server server.cpp)
-target_linklib_libraries(server PRIVATE libzmq cppzmq msgpack-cxx)
+target_link_libraries(server PRIVATE PkgConfig::ZeroMQ)
 
-add_executable(cliente cliente.cpp)
-target_linklib_libraries(cliente PRIVATE libzmq cppzmq msgpack-cxx)
+add_executable(client client.cpp)
+target_link_libraries(client PRIVATE PkgConfig::ZeroMQ)
+
+add_executable(broker broker.cpp)
+target_link_libraries(broker PRIVATE PkgConfig::ZeroMQ)
