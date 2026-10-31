@@ -1,64 +1,50 @@
-const zm1 = require('zeromq');
-const msgpack = require('msgpack5');
+const zmq = require('zeromq');
+const msgpack = require('msgpack5')();
 
 function getTimestamp() {
     const now = new Date();
     const pad = (n) => String(n).padStart(2, '0');
 
-    const year = now.getFullYear();
-    const month = pad(now.getMonth() + 1);
-    const day = pad(now.getDate());
-    const hours = pad(now.getHours());
-    const minutes = pad(now.getMinutes());
-    const seconds = pad(now.getSeconds());
-
-    return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
-
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ` +
+        `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
 }
 
-
-async function sendRequest(sock, requestData) {
-    const packed = msgpacj.encode(requestData);
-    
-    await sock.send(packed);
-
-    const [replyBuffer] = await sock.receive();
-    return msgpack.Decoder(replyBuffer);
+async function sendRequest(socket, requestData) {
+    await socket.send(msgpack.encode(requestData));
+    const [replyBuffer] = await socket.receive();
+    return msgpack.decode(replyBuffer);
 }
 
 async function main() {
-    const sock = new zmq.Request();
-
-    sock.connect('tcp://server:5555');
+    const socket = new zmq.Request();
+    socket.connect('tcp://server-javascript:5555');
     const timestamp = getTimestamp();
 
-    try{
-        const loginReq = {
+    try {
+        const login = await sendRequest(socket, {
             action: 'login',
-            username: 'JS',
-            timestamp: timestamp
-        };
-        const loginRep = await sendRequest(sock, loginReq);
-        console.log(`[${timestamp}][LOGIN RESP]${loginRep.message || ''}`);
+            username: 'JAVASCRIPT',
+            timestamp
+        });
+        console.log(`[${timestamp}][LOGIN RESP] ${login.message || ''}`);
 
-        const createReq = {
+        const channel = await sendRequest(socket, {
             action: 'create_channel',
             channel: 'geral',
-            timestamp = timestamp
-        };
-        const createRep = await sendRequest(sock, createReq);
-        console.log(`[${timestamp}][CHANNEL RESP] ${createRep.message || ''}`);
+            timestamp
+        });
+        console.log(`[${timestamp}][CHANNEL RESP] ${channel.message || ''}`);
 
-        const listReq = {
+        const channels = await sendRequest(socket, {
             action: 'list_channels',
-            timestamp: timestamp
-        };
-        const listRep = await sendRequest(sock, listReq);
-        console.log(`[${timestamp}][CANAIS] ${listRep.channel || ''}`);
-    } catch (error){
-        console.error('Erro na comunicação: ', error);
+            timestamp
+        });
+        console.log(`[${timestamp}][CANAIS] ${channels.channels || ''}`);
+    } catch (error) {
+        console.error('Erro na comunicação:', error);
+        process.exitCode = 1;
     } finally {
-        await sock.close();
+        await socket.close();
     }
 }
 

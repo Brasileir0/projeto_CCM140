@@ -30,7 +30,7 @@ void send_request(zmq::socket_t& socket, const std::map<std::string, std::string
 int main() {
     zmq::context_t context(1);
     zmq::socket_t socket(context, zmq::socket_type::req);
-    socket.connect("tcp://server:5555");
+    socket.connect("tcp://server-cpp:5555");
 
     std::string timestamp = get_timestamp();
 

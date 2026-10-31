@@ -1,20 +1,42 @@
-version: '3.8'
-
 services:
-  server:
+  server-python:
     build:
-      context: ./source/cpp
+      context: ./python
       dockerfile: Dockerfile
-    container_name: server_cpp
-    ports:
-      - "5555:5555"
+    command: ["python", "server.py"]
+
+  client-python:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    command: ["python", "client.py"]
+    depends_on:
+      - server-python
+
+  server-javascript:
+    build:
+      context: ./javascript
+      dockerfile: Dockerfile
+    command: ["node", "server.js"]
+
+  client-javascript:
+    build:
+      context: ./javascript
+      dockerfile: Dockerfile
+    command: ["node", "client.js"]
+    depends_on:
+      - server-javascript
+
+  server-cpp:
+    build:
+      context: ./cpp
+      dockerfile: Dockerfile
     command: ["./build/server"]
 
-  client:
-    build: 
-      context: ./source/cpp
+  client-cpp:
+    build:
+      context: ./cpp
       dockerfile: Dockerfile
-    container_name: client_cpp
-    depends_on:
-      - server
     command: ["./build/client"]
+    depends_on:
+      - server-cpp
