@@ -2,8 +2,9 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir pyzmq
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY broker.py cliente.py servidor.py ./
+COPY client.py server.py ./
 
-CMD ["python", "broker.py"]
+CMD ["python", "server.py"]
