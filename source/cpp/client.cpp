@@ -8,6 +8,10 @@
 #include <zmq.hpp>
 #include <msgpack.hpp>
 #include <map>
+#include <thread>
+#include <set>
+#include <vector>
+#include <random>
 
 std::string get_timestamp() {
     auto now = std::chrono::system_clock::now();
@@ -38,6 +42,35 @@ void send_request(
     msgpack::object_handle oh = msgpack::unpack(static_cast<const char*>(reply.data()), reply.size());
     oh.get().convert(response_data);
     std::cout << "[" << timestamp << "][REP] " << response_data[response_field] << std::endl;
+}
+
+void subscriber_loop(const std::string& pub_endpoint, std::set<std::string>& subscribed_channels) {
+    zmq::context_t sub_context(1);
+    zmq::socket_t sub_socket(sub_context, zmq::socket_type::sub);
+    sub_socket.connect(pub_endpoint);
+
+    // Inscreve-se nos canais desejados dinamicamente
+    for (const auto& ch : subscribed_channels) {
+        sub_socket.set(zmq::sockopt::subscribe, ch);
+        std::cout << "[Cliente SUB] Inscrito no topico/canal: " << ch << std::endl;
+    }
+
+    while (true) {
+        zmq::message_t channel_frame;
+        zmq::message_t payload_frame;
+        
+        auto res1 = sub_socket.recv(channel_frame, zmq::recv_flags::none);
+        auto res2 = sub_socket.recv(payload_frame, zmq::recv_flags::none);
+
+        if (res1 && res2) {
+            std::string channel(static_cast<char*>(channel_frame.data()), channel_frame.size());
+            std::string content(static_cast<char*>(payload_frame.data()), payload_frame.size());
+            std::string receive_time = get_timestamp();
+
+            std::cout << "\n[RECEBIDO PUB] Canal: [" << channel << "] | Conteudo: " << content 
+                      << " | Hora Recebimento: " << receive_time << std::endl;
+        }
+    }
 }
 
 int main() {
@@ -80,3 +113,17 @@ int main() {
 
     return 0;
 }
+
+// std::set<std::string> my_subscriptions = {"geral", "tecnologia", "geral2"}; // Exemplo
+// std::thread sub_thread(subscriber_loop, "tcp://proxy-pubsub:5558", std::ref(my_subscriptions));
+// sub_thread.detach();
+
+// proxy-pubsub:
+//     build:
+//       context: .
+//       dockerfile: Dockerfile.proxy # ou use um Dockerfile dedicado ao broker
+//     ports:
+//       - "5557:5557"
+//       - "5558:5558"
+//     networks:
+//       - rede-projeto
