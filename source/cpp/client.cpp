@@ -111,19 +111,14 @@ int main() {
         socket.close();
     }
 
+
+    std::set<std::string> my_subscriptions = {"geral", "tecnologia"}; 
+    std::thread sub_thread(subscriber_loop, "tcp://localhost:5558", std::ref(my_subscriptions));
+    sub_thread.detach();
+
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::hours(1));
+    }
+
     return 0;
 }
-
-// std::set<std::string> my_subscriptions = {"geral", "tecnologia", "geral2"}; // Exemplo
-// std::thread sub_thread(subscriber_loop, "tcp://proxy-pubsub:5558", std::ref(my_subscriptions));
-// sub_thread.detach();
-
-// proxy-pubsub:
-//     build:
-//       context: .
-//       dockerfile: Dockerfile.proxy # ou use um Dockerfile dedicado ao broker
-//     ports:
-//       - "5557:5557"
-//       - "5558:5558"
-//     networks:
-//       - rede-projeto

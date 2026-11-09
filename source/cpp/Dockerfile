@@ -15,8 +15,7 @@ WORKDIR /app
 
 COPY . /app
 
-RUN mkdir -p build && cd build && \
-    cmake .. && \
-    make
+RUN cmake -S . -B build
+RUN cmake --build build -j$(nproc)
 
 CMD ["./build/server"]

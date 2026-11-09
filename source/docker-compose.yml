@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   server-python-1:
     build:
@@ -7,6 +9,8 @@ services:
     restart: unless-stopped
     volumes:
       - server_python_1_data:/app/data
+    networks:
+      - rede-projeto
 
   server-python-2:
     build:
@@ -16,6 +20,8 @@ services:
     restart: unless-stopped
     volumes:
       - server_python_2_data:/app/data
+    networks:
+      - rede-projeto
 
   client-python-1:
     build:
@@ -31,6 +37,9 @@ services:
       - server-javascript-2
       - server-cpp-1
       - server-cpp-2
+      - proxy-pubsub
+    networks:
+      - rede-projeto
 
   client-python-2:
     build:
@@ -46,6 +55,9 @@ services:
       - server-javascript-2
       - server-cpp-1
       - server-cpp-2
+      - proxy-pubsub
+    networks:
+      - rede-projeto
 
   server-javascript-1:
     build:
@@ -55,6 +67,8 @@ services:
     restart: unless-stopped
     volumes:
       - server_javascript_1_data:/app/data
+    networks:
+      - rede-projeto
 
   server-javascript-2:
     build:
@@ -64,6 +78,8 @@ services:
     restart: unless-stopped
     volumes:
       - server_javascript_2_data:/app/data
+    networks:
+      - rede-projeto
 
   client-javascript-1:
     build:
@@ -79,6 +95,9 @@ services:
       - server-javascript-2
       - server-cpp-1
       - server-cpp-2
+      - proxy-pubsub
+    networks:
+      - rede-projeto
 
   client-javascript-2:
     build:
@@ -94,6 +113,9 @@ services:
       - server-javascript-2
       - server-cpp-1
       - server-cpp-2
+      - proxy-pubsub
+    networks:
+      - rede-projeto
 
   server-cpp-1:
     build:
@@ -103,6 +125,8 @@ services:
     restart: unless-stopped
     volumes:
       - server_cpp_1_data:/app/data
+    networks:
+      - rede-projeto
 
   server-cpp-2:
     build:
@@ -112,6 +136,8 @@ services:
     restart: unless-stopped
     volumes:
       - server_cpp_2_data:/app/data
+    networks:
+      - rede-projeto
 
   client-cpp-1:
     build:
@@ -127,6 +153,9 @@ services:
       - server-javascript-2
       - server-cpp-1
       - server-cpp-2
+      - proxy-pubsub
+    networks:
+      - rede-projeto
 
   client-cpp-2:
     build:
@@ -142,6 +171,21 @@ services:
       - server-javascript-2
       - server-cpp-1
       - server-cpp-2
+      - proxy-pubsub
+    networks:
+      - rede-projeto
+
+  proxy-pubsub:
+    build:
+      context: ./cpp # ou o diretório onde está o seu proxy_pubsub.cpp / Dockerfile
+      dockerfile: Dockerfile
+    command: ["./build/proxy_pubsub"] # Ajuste para o comando correto do seu binário do proxy
+    ports:
+      - "5557:5557"
+      - "5558:5558"
+    restart: unless-stopped
+    networks:
+      - rede-projeto
 
 volumes:
   server_python_1_data:
@@ -150,3 +194,7 @@ volumes:
   server_javascript_2_data:
   server_cpp_1_data:
   server_cpp_2_data:
+
+networks:
+  rede-projeto:
+    driver: bridge
