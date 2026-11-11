@@ -185,6 +185,42 @@ services:
     networks:
       - rede-projeto
 
+  proxy-pubsub-js:
+    build:
+      context: ./javascript
+      dockerfile: Dockerfile
+    command: ["node", "proxy_pubsub.js"]
+    ports:
+      - "5557:5557"
+      - "5558:5558"
+    restart: unless-stopped
+    networks:
+      - rede-projeto
+
+  proxy-pubsub-py:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    command: ["python", "proxy_pubsub.py"]
+    ports:
+      - "5557:5557"
+      - "5558:5558"
+    restart: unless-stopped
+    networks:
+      - rede-projeto
+
+  proxy-pubsub-cpp:
+    build:
+      context: ./cpp
+      dockerfile: Dockerfile
+    command: ["./build/proxy_pubsub"]
+    ports:
+      - "5557:5557"
+      - "5558:5558"
+    restart: unless-stopped
+    networks:
+      - rede-projeto
+
 volumes:
   server_python_1_data:
   server_python_2_data:
