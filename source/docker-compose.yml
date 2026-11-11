@@ -67,6 +67,8 @@ services:
     restart: unless-stopped
     volumes:
       - server_javascript_1_data:/app/data
+    depends_on:
+      - proxy-pubsub
     networks:
       - rede-projeto
 
@@ -78,6 +80,8 @@ services:
     restart: unless-stopped
     volumes:
       - server_javascript_2_data:/app/data
+    depends_on:
+      - proxy-pubsub
     networks:
       - rede-projeto
 
@@ -87,14 +91,11 @@ services:
       dockerfile: Dockerfile
     command: ["node", "client.js"]
     environment:
-      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
+      SERVER_ENDPOINTS: "tcp://server-javascript-1:5555"
+      BOT_NAME: "JAVASCRIPT-1"
     depends_on:
-      - server-python-1
-      - server-python-2
       - server-javascript-1
       - server-javascript-2
-      - server-cpp-1
-      - server-cpp-2
       - proxy-pubsub
     networks:
       - rede-projeto
@@ -105,14 +106,11 @@ services:
       dockerfile: Dockerfile
     command: ["node", "client.js"]
     environment:
-      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
+      SERVER_ENDPOINTS: "tcp://server-javascript-1:5555"
+      BOT_NAME: "JAVASCRIPT-2"
     depends_on:
-      - server-python-1
-      - server-python-2
       - server-javascript-1
       - server-javascript-2
-      - server-cpp-1
-      - server-cpp-2
       - proxy-pubsub
     networks:
       - rede-projeto
@@ -177,9 +175,9 @@ services:
 
   proxy-pubsub:
     build:
-      context: ./cpp # ou o diretório onde está o seu proxy_pubsub.cpp / Dockerfile
+      context: ./javascript
       dockerfile: Dockerfile
-    command: ["./build/proxy_pubsub"] # Ajuste para o comando correto do seu binário do proxy
+    command: ["node", "proxy_pubsub.js"]
     ports:
       - "5557:5557"
       - "5558:5558"
