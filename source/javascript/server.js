@@ -3,112 +3,121 @@ const msgpack = require('msgpack5')();
 const fs = require('fs');
 const path = require('path');
 
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const USERS_FILE = path.join(DATA_DIR, 'users.txt');
 const CHANNELS_FILE = path.join(DATA_DIR, 'channels.txt');
+const EVENTS_FILE = path.join(DATA_DIR, 'events.jsonl');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function getTimestamp() {
-    const now = new Date();
-    const pad = (n) => String(n).padStart(2, '0');
-    
-    const year = now.getFullYear();
-    const month = pad(now.getMonth() + 1);
-    const day = pad(now.getDate());
-    const hours = pad(now.getHours());
-    const minutes = pad(now.getMinutes());
-    const seconds = pad(now.getSeconds());
+    return new Date().toISOString();
+}
 
-    return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+function persistEvent(event) {
+    fs.appendFileSync(EVENTS_FILE, `${JSON.stringify(event)}\n`, 'utf8');
 }
 
 function saveUser(username, timestamp) {
-    const line = `${username},${timestamp}\n`;
-    fs.appendFileSync(USERS_FILE, line, 'utf8');
+    fs.appendFileSync(USERS_FILE, `${username},${timestamp}\n`, 'utf8');
 }
 
-function saveChannel(channel) {
-    const line = `${channel}\n`;
-    fs.appendFileSync(CHANNELS_FILE, line, 'utf8');
+function saveChannel(channel, timestamp) {
+    fs.appendFileSync(CHANNELS_FILE, `${channel}\n`, 'utf8');
+    persistEvent({ type: 'channel_created', channel, timestamp });
 }
 
 function loadChannels() {
-    const channels = new Set();
-    if (fs.existsSync(CHANNELS_FILE)) {
-        const data = fs.readFileSync(CHANNELS_FILE, 'utf8');
-        const lines = data.split('\n');
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (trimmed !== '') {
-                channels.add(trimmed);
-            }
-        }
+    if (!fs.existsSync(CHANNELS_FILE)) {
+        return new Set();
     }
-    return channels;
+
+    return new Set(
+        fs.readFileSync(CHANNELS_FILE, 'utf8')
+            .split(/\r?\n/)
+            .map((channel) => channel.trim())
+            .filter(Boolean)
+    );
 }
 
 async function main() {
-    const sock = new zmq.Reply();
+    const replySocket = new zmq.Reply();
+    const publisher = new zmq.Publisher();
+    await replySocket.bind(process.env.SERVER_ENDPOINT || 'tcp://*:5555');
+    publisher.connect(process.env.PUBSUB_XSUB_ENDPOINT || 'tcp://proxy-pubsub:5557');
+    console.log('[Servidor JS] Req-Rep ativo na porta 5555; Pub conectado ao proxy.');
 
-    await sock.bind('tcp://*:5555');
-    console.log('[Servidor JS] Iniciado na porta 5555...');
+    for await (const [requestBuffer] of replySocket) {
+        const receivedAt = getTimestamp();
+        let request;
+        let response;
 
-    for await (const [requestBuffer] of sock) {
-        const reqMap = msgpack.decode(requestBuffer);
-        const action = reqMap.action;
-        const requestTimestamp = reqMap.timestamp;
-        let repMap = {};
+        try {
+            request = msgpack.decode(requestBuffer);
+            persistEvent({ type: 'request', receivedAt, request });
 
-        if (typeof requestTimestamp !== 'string' || requestTimestamp.trim() === '') {
-            repMap.status = 'error';
-            repMap.message = 'Timestamp ausente';
-            console.log(`[${getTimestamp()}][ERRO] Timestamp ausente`);
-        } else if (action === 'login') {
-            const username = typeof reqMap.username === 'string' ? reqMap.username.trim() : '';
-            if (username === '') {
-                repMap.status = 'error';
-                repMap.message = 'Nome de usuário inválido';
-                console.log(`[${requestTimestamp}][LOGIN ERRO] Nome inválido`);
+            if (!request || typeof request !== 'object' ||
+                typeof request.timestamp !== 'string' || request.timestamp.trim() === '') {
+                response = { status: 'error', message: 'Timestamp ausente ou requisição inválida' };
+            } else if (request.action === 'login') {
+                const username = typeof request.username === 'string' ? request.username.trim() : '';
+                if (!username) {
+                    response = { status: 'error', message: 'Nome de usuário inválido' };
+                } else {
+                    saveUser(username, request.timestamp);
+                    response = { status: 'success', message: 'Login realizado com sucesso' };
+                }
+            } else if (request.action === 'create_channel') {
+                const channel = typeof request.channel === 'string' ? request.channel.trim() : '';
+                const channels = loadChannels();
+                if (!channel) {
+                    response = { status: 'error', message: 'Nome de canal inválido' };
+                } else if (channels.has(channel)) {
+                    response = { status: 'error', message: 'Canal já existe' };
+                } else {
+                    saveChannel(channel, request.timestamp);
+                    response = { status: 'success', message: 'Canal criado com sucesso' };
+                }
+            } else if (request.action === 'list_channels') {
+                response = {
+                    status: 'success',
+                    channels: Array.from(loadChannels()).sort()
+                };
+            } else if (request.action === 'publish') {
+                const channel = typeof request.channel === 'string' ? request.channel.trim() : '';
+                const message = typeof request.message === 'string' ? request.message : '';
+                if (!channel || !message.trim()) {
+                    response = { status: 'error', message: 'Canal ou mensagem inválidos' };
+                } else if (!loadChannels().has(channel)) {
+                    response = { status: 'error', message: 'Canal não existe' };
+                } else {
+                    const publication = {
+                        channel,
+                        message,
+                        timestamp: getTimestamp()
+                    };
+                    persistEvent({ type: 'publication', ...publication, requestTimestamp: request.timestamp });
+                    await publisher.send([Buffer.from(channel), msgpack.encode(publication)]);
+                    response = { status: 'success', message: 'Publicação enviada' };
+                }
             } else {
-                saveUser(username, requestTimestamp);
-                console.log(`[${requestTimestamp}][LOGIN] Usuário: ${username}`);
-                repMap.status = 'success';
-                repMap.message = 'Login realizado com sucesso';
+                response = { status: 'error', message: 'Ação desconhecida' };
             }
-        } else if (action === 'create_channel') {
-            const channel = typeof reqMap.channel === 'string' ? reqMap.channel.trim() : '';
-            const channels = loadChannels();
-
-            if (channel === '') {
-                repMap.status = 'error';
-                repMap.message = 'Nome de canal inválido';
-                console.log(`[${requestTimestamp}][CANAL ERRO] Nome inválido`);
-            } else if (!channels.has(channel)) {
-                saveChannel(channel);
-                console.log(`[${requestTimestamp}][CHANNEL] Canal criado: ${channel}`);
-                repMap.status = 'success';
-                repMap.message = 'Canal criado com sucesso';
-            } else {
-                repMap.status = 'error';
-                repMap.message = 'Canal já existe';
-                console.log(`[${requestTimestamp}][CANAL ERRO] Já existe: ${channel}`);
-            }
-        } else if (action === 'list_channels') {
-            repMap.status = 'success';
-            repMap.channels = Array.from(loadChannels()).sort().join(';');
-            console.log(`[${requestTimestamp}][CANAIS] Lista enviada: ${repMap.channels}`);
-        } else {
-            repMap.status = 'error';
-            repMap.message = 'Ação desconhecida';
-            console.log(`[${requestTimestamp}][ERRO] Ação desconhecida: ${action}`);
+        } catch (error) {
+            console.error('[Servidor JS] Erro ao processar/persistir requisição:', error);
+            response = { status: 'error', message: 'Falha ao processar a requisição' };
         }
 
-        repMap.timestamp = getTimestamp();
-        const replyBuffer = msgpack.encode(repMap);
-        await sock.send(replyBuffer);
+        response.timestamp = getTimestamp();
+        try {
+            persistEvent({ type: 'response', timestamp: response.timestamp, response });
+            await replySocket.send(msgpack.encode(response));
+        } catch (error) {
+            console.error('[Servidor JS] Erro ao persistir/enviar resposta:', error);
+        }
     }
 }
 
-main().catch(err => {
-    console.error('Erro no servidor:', err);
+main().catch((error) => {
+    console.error('[Servidor JS] Falha fatal:', error);
+    process.exitCode = 1;
 });
