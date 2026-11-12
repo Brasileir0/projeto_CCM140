@@ -1,127 +1,167 @@
 import os
+import random
+import threading
 import time
 from datetime import datetime
+
 import msgpack
 import zmq
-import random
+
+
+def get_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def format_timestamp(timestamp: object) -> str:
+    if not isinstance(timestamp, str):
+        return "desconhecido"
+    if len(timestamp) >= 16 and timestamp[10] in ("T", " "):
+        return f"{timestamp[:10]} {timestamp[11:16]}"
+    return timestamp
 
 
 def send_request(
     socket: zmq.Socket,
     request: dict[str, str],
-    response_field: str,
+    response_field: str = "message",
 ) -> dict[str, str]:
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = get_timestamp()
     request["timestamp"] = timestamp
-    print(f"[{timestamp}][REQ] {request['action']}", flush=True)
+    print(f"[{format_timestamp(timestamp)}][REQ] {request['action']}", flush=True)
     socket.send(msgpack.packb(request, use_bin_type=True))
     response = msgpack.unpackb(socket.recv(), raw=False)
     if not isinstance(response, dict):
         raise ValueError("Resposta inválida do servidor.")
-    print(f"[{timestamp}][REP] {response.get(response_field, '')}", flush=True)
+    print(
+        f"[{format_timestamp(response.get('timestamp', timestamp))}]"
+        f"[REP] {response.get(response_field, response.get('status', ''))}",
+        flush=True,
+    )
     return response
 
-def receive_message(subscriber: zmq.Socket) -> None:
-    frames = subscriber.recv_multipart()
 
-    if len(frames) != 2:
-        print("[ERRO] Formato de publicação inválido", flush=True)
-        return
-
-    channel = frames[0].decode("utf-8")
-
-    publication = msgpack.unpackb(frames[1], raw=False)
-
-    received_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    message = publication.get("message", "")
-    sent_at = publication.get("timestamp", "")
-
-    print("\n========== NOVA MENSAGEM ==========", flush=True)
-    print(f"Canal: {channel}", flush=True)
-    print(f"Mensagem: {message}", flush=True)
-    print(f"Enviada em: {sent_at}", flush=True)
-    print(f"Recebida em: {received_at}", flush=True)
-    print("===================================\n", flush=True)
-
-def publish_message(socket: zmq.Socket, channel: str, message: str) -> None:
-    request = {
-        "action": "publish",
-        "channel": channel,
-        "message": message
-    }   
-
-    response = send_request(socket, request, "message")
-
-    if response.get("status") == "success":
-        print(f"[PUBLICAÇÃO] Mensagem enviada ao canal {channel}", flush=True)
-
-    else:
-        print(f"[ERRO PUBLICAÇÃO] {response.get('message', '')}", flush=True)
-
-def main() -> None:
-    username = "PYTHON"
-    endpoints = os.environ.get("SERVER_ENDPOINTS", "tcp://server-python:5555").split(",")
+def receive_messages(endpoint: str, channels: list[str]) -> None:
     context = zmq.Context()
-
     subscriber = context.socket(zmq.SUB)
-    subscriber.connect("tcp://proxy-pubsub:5558")
-
-
+    subscriber.connect(endpoint)
+    for channel in channels:
+        subscriber.setsockopt_string(zmq.SUBSCRIBE, channel)
     try:
-        for endpoint in endpoints:
-            endpoint = endpoint.strip()
-            if not endpoint:
+        while True:
+            frames = subscriber.recv_multipart()
+            if len(frames) != 2:
+                print("[ERRO] Formato de publicação inválido", flush=True)
                 continue
-            print(f"[Cliente Python] Conectando a {endpoint}", flush=True)
-            socket = context.socket(zmq.REQ)
-            socket.connect(endpoint)
-            try:
-                login_request = {"action": "login", "username": username}
-                login = send_request(socket, login_request, "message")
-                while login.get("status") != "success":
-                    time.sleep(1)
-                    login = send_request(socket, login_request.copy(), "message")
 
-                send_request(
-                    socket,
-                    {"action": "create_channel", "channel": "geral"},
-                    "message",
-                )
+            channel = frames[0].decode("utf-8")
+            publication = msgpack.unpackb(frames[1], raw=False)
+            if not isinstance(publication, dict):
+                print("[ERRO] Conteúdo de publicação inválido", flush=True)
+                continue
 
-                channel_response = send_request(
-                    socket,
-                    {"action": "list_channels"},
-                    "channels"
-                )
-
-                channels = channel_response.get("channels", "").split(";")
-                channels = [channel for channel in channels if channel]
-
-                select_channels = random.sample(
-                    channels,
-                    min(3, len(channels))
-                )
-
-                for channel in select_channels:
-                    subscriber.setsockopt_string(zmq.SUBSCRIBE, channel)
-                    print(f"[SUB] Inscrito no canal: {channel}", flush=True)
-
-            finally:
-                socket.close()
-
-            poller = zmq.Poller()
-            poller.register(subscriber, zmq.POLLIN)
-        
-            while True:
-                events = dict(poller.poll(timeout=1000))
-        
-                if subscriber in events:
-                    if events[subscriber] == zmq.POLLIN:
-                        receive_message(subscriber)
-            
+            received_at = get_timestamp()
+            print(
+                "\n---------- NOVA MENSAGEM ---------\n"
+                f"Canal: {channel}\n"
+                f"Mensagem: {publication.get('message', '')}\n"
+                f"Enviada em: {format_timestamp(publication.get('timestamp'))}\n"
+                f"Recebida em: {format_timestamp(received_at)}\n"
+                "------------------------------------\n",
+                flush=True,
+            )
     finally:
         subscriber.close()
+        context.term()
+
+
+def list_channels(socket: zmq.Socket) -> list[str]:
+    response = send_request(socket, {"action": "list_channels"}, "channels")
+    if response.get("status") != "success":
+        raise RuntimeError(f"Não foi possível listar canais: {response.get('message', '')}")
+
+    channels = response.get("channels", "")
+    if isinstance(channels, list):
+        return [channel for channel in channels if isinstance(channel, str) and channel]
+    if isinstance(channels, str):
+        return [channel.strip() for channel in channels.split(";") if channel.strip()]
+    raise ValueError("A resposta do servidor contém uma lista de canais inválida.")
+
+
+def main() -> None:
+    username = os.environ.get("BOT_NAME", f"PYTHON-{os.getpid()}")
+    endpoints = [
+        endpoint.strip()
+        for endpoint in os.environ.get("SERVER_ENDPOINTS", "tcp://server-python:5555").split(",")
+        if endpoint.strip()
+    ]
+    if not endpoints:
+        raise ValueError("SERVER_ENDPOINTS não contém endpoints válidos.")
+
+    context = zmq.Context()
+    request_socket = context.socket(zmq.REQ)
+    endpoint = random.choice(endpoints)
+    request_socket.connect(endpoint)
+
+    try:
+        print(f"[Cliente Python] Conectado a {endpoint} como {username}", flush=True)
+        login = send_request(
+            request_socket,
+            {"action": "login", "username": username},
+        )
+        if login.get("status") != "success":
+            raise RuntimeError(f"Login falhou: {login.get('message', '')}")
+
+        channels = list_channels(request_socket)
+        if len(channels) < 5:
+            channel = f"canal-{username}-{int(time.time() * 1000)}"
+            created = send_request(
+                request_socket,
+                {"action": "create_channel", "channel": channel},
+            )
+            if created.get("status") != "success":
+                raise RuntimeError(f"Não foi possível criar o canal {channel}: {created.get('message', '')}")
+            channels = list_channels(request_socket)
+        if not channels:
+            raise RuntimeError("O servidor não retornou canais disponíveis.")
+
+        subscriptions = random.sample(channels, min(3, len(channels)))
+        for channel in subscriptions:
+            print(f"[SUB] Inscrito no canal: {channel}", flush=True)
+
+        threading.Thread(
+            target=receive_messages,
+            args=(
+                os.environ.get("PUBSUB_XPUB_ENDPOINT", "tcp://proxy-pubsub:5558"),
+                subscriptions,
+            ),
+            daemon=True,
+        ).start()
+        time.sleep(1)
+
+        while True:
+            channel = random.choice(channels)
+            for index in range(10):
+                message = (
+                    f"Mensagem {index + 1} de {username}: "
+                    f"{''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))}"
+                )
+                response = send_request(
+                    request_socket,
+                    {
+                        "action": "publish",
+                        "channel": channel,
+                        "message": message,
+                        "username": username,
+                    },
+                )
+                if response.get("status") != "success":
+                    print(
+                        f"[ERRO PUBLICAÇÃO] {response.get('message', '')}",
+                        flush=True,
+                    )
+                time.sleep(1)
+    finally:
+        request_socket.close()
         context.term()
 
 

@@ -10,7 +10,7 @@ CHANNELS_FILE = DATA_DIR / "channels.txt"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
 
 def get_timestamp() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now().astimezone().isoformat()
 
 def load_channels() -> set[str]:
     if not CHANNELS_FILE.exists():
@@ -109,11 +109,7 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
             msgpack.packb(publication, use_bin_type=True)
         ])
 
-        print(
-            f"[{publication[timestamp]}][PUB]"
-            f"Canal: {channel} | Mensagem: {message}",
-            flush=True
-            )
+        print(f"[{publication['timestamp']}][PUB]"f"Canal: {channel} | Mensagem: {message}",flush=True)
 
         return{
             "status": "success",
@@ -143,11 +139,22 @@ def main() -> None:
     try:
         while True:
             request = msgpack.unpackb(socket.recv(), raw=False)
+            received_at = get_timestamp()
+            persist_event({
+                "type": "request",
+                "received_at": received_at,
+                "request": request
+            })
             if not isinstance(request, dict):
                 response = {"status": "error", "message": "Requisição inválida"}
             else:
                 response = handle_request(request, publisher)
             response["timestamp"] = get_timestamp()
+            persist_event({
+                "type": "response",
+                "timestamp": response["timestamp"],
+                "response": response
+            })
             socket.send(msgpack.packb(response, use_bin_type=True))
     finally:
         socket.close()
