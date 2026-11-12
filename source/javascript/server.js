@@ -80,7 +80,7 @@ async function main() {
             } else if (request.action === 'list_channels') {
                 response = {
                     status: 'success',
-                    channels: Array.from(loadChannels()).sort()
+                    channels: Array.from(loadChannels()).sort().join(';')
                 };
             } else if (request.action === 'publish') {
                 const channel = typeof request.channel === 'string' ? request.channel.trim() : '';

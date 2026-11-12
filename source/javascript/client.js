@@ -5,12 +5,30 @@ function getTimestamp() {
     return new Date().toISOString();
 }
 
+function formatTimestamp(timestamp) {
+    if (typeof timestamp !== 'string') {
+        return 'desconhecido';
+    }
+    const match = timestamp.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/);
+    return match ? `${match[1]}, ${match[2]}` : timestamp;
+}
+
 function delay(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function chooseRandom(items) {
     return items[Math.floor(Math.random() * items.length)];
+}
+
+function normalizeChannels(channels) {
+    if (Array.isArray(channels)) {
+        return channels.filter((channel) => typeof channel === 'string' && channel.length > 0);
+    }
+    if (typeof channels === 'string') {
+        return channels.split(';').map((channel) => channel.trim()).filter(Boolean);
+    }
+    throw new Error('A resposta do servidor não contém uma lista de canais válida.');
 }
 
 async function sendRequest(socket, requestData) {
@@ -38,8 +56,12 @@ async function receivePublications(socket, subscribedChannels) {
         try {
             const publication = msgpack.decode(frames[1]);
             console.log(
-                `[PUB][canal=${channel}][enviada=${publication.timestamp}]` +
-                `[recebida=${getTimestamp()}] ${publication.message}`
+                `\n---------- NOVA MENSAGEM ---------\n` +
+                `Canal: ${channel}\n` +
+                `Mensagem: ${publication.message}\n` +
+                `Enviada em: ${formatTimestamp(publication.timestamp)}\n` +
+                `Recebida em: ${formatTimestamp(getTimestamp())}\n` +
+                `------------------------------------\n`
             );
         } catch (error) {
             console.error(`[Cliente JS] Publicação inválida no canal ${channel}:`, error);
@@ -48,10 +70,7 @@ async function receivePublications(socket, subscribedChannels) {
 }
 
 async function ensureChannel(socket, channels, username) {
-    if (!Array.isArray(channels)) {
-        throw new Error('A resposta do servidor não contém uma lista de canais válida.');
-    }
-
+    channels = normalizeChannels(channels);
     if (channels.length >= 5) {
         return channels;
     }
@@ -63,10 +82,10 @@ async function ensureChannel(socket, channels, username) {
     }
 
     const updated = await sendRequest(socket, { action: 'list_channels' });
-    if (updated.status !== 'success' || !Array.isArray(updated.channels)) {
+    if (updated.status !== 'success') {
         throw new Error('Não foi possível atualizar a lista de canais.');
     }
-    return updated.channels;
+    return normalizeChannels(updated.channels);
 }
 
 async function main() {
@@ -103,7 +122,7 @@ async function main() {
         if (channelList.status !== 'success') {
             throw new Error(`Não foi possível listar canais: ${channelList.message}`);
         }
-        let { channels } = channelList;
+        let channels = normalizeChannels(channelList.channels);
         channels = await ensureChannel(requestSocket, channels, username);
         if (channels.length === 0) {
             throw new Error('O servidor não retornou canais disponíveis.');
@@ -117,6 +136,7 @@ async function main() {
             subscriber.subscribe(channel);
             console.log(`[Cliente JS] Inscrito no canal ${channel}`);
         }
+        await delay(250);
 
         while (true) {
             const channel = chooseRandom(channels);
