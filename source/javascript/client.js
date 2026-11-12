@@ -2,7 +2,10 @@ const zmq = require('zeromq');
 const msgpack = require('msgpack5')();
 
 function getTimestamp() {
-    return new Date().toISOString();
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    ` ${pad(now.getHours())}:${pad(now.getMinutes())}`;
 }
 
 function formatTimestamp(timestamp) {
@@ -10,7 +13,7 @@ function formatTimestamp(timestamp) {
         return 'desconhecido';
     }
     const match = timestamp.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/);
-    return match ? `${match[1]}, ${match[2]}` : timestamp;
+    return match ? `${match[1]} ${match[2]}` : timestamp;
 }
 
 function delay(milliseconds) {
@@ -33,11 +36,11 @@ function normalizeChannels(channels) {
 
 async function sendRequest(socket, requestData) {
     const request = { ...requestData, timestamp: getTimestamp() };
-    console.log(`[${request.timestamp}][REQ] ${request.action}`);
+    console.log(`[${formatTimestamp(request.timestamp)}][REQ] ${request.action}`);
     await socket.send(msgpack.encode(request));
     const [replyBuffer] = await socket.receive();
     const response = msgpack.decode(replyBuffer);
-    console.log(`[${response.timestamp}][REP] ${response.message || response.status}`);
+    console.log(`[${formatTimestamp(response.timestamp)}][REP] ${response.message || response.status}`);
     return response;
 }
 
