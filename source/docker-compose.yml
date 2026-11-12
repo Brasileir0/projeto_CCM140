@@ -29,6 +29,7 @@ services:
       dockerfile: Dockerfile
     command: ["python", "client.py"]
     environment:
+      BOT_NAME: "PYTHON-1"
       SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
     depends_on:
       - server-python-1
@@ -47,6 +48,7 @@ services:
       dockerfile: Dockerfile
     command: ["python", "client.py"]
     environment:
+      BOT_NAME: "PYTHON-2"
       SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
     depends_on:
       - server-python-1
@@ -143,6 +145,7 @@ services:
       dockerfile: Dockerfile
     command: ["./build/client"]
     environment:
+      BOT_NAME: "CPP-1"
       SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
     depends_on:
       - server-python-1
@@ -161,6 +164,7 @@ services:
       dockerfile: Dockerfile
     command: ["./build/client"]
     environment:
+      BOT_NAME: "CPP-2"
       SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
     depends_on:
       - server-python-1
@@ -190,9 +194,6 @@ services:
       context: ./javascript
       dockerfile: Dockerfile
     command: ["node", "proxy_pubsub.js"]
-    ports:
-      - "5557:5557"
-      - "5558:5558"
     restart: unless-stopped
     networks:
       - rede-projeto
@@ -202,9 +203,6 @@ services:
       context: ./python
       dockerfile: Dockerfile
     command: ["python", "proxy_pubsub.py"]
-    ports:
-      - "5557:5557"
-      - "5558:5558"
     restart: unless-stopped
     networks:
       - rede-projeto
@@ -214,9 +212,6 @@ services:
       context: ./cpp
       dockerfile: Dockerfile
     command: ["./build/proxy_pubsub"]
-    ports:
-      - "5557:5557"
-      - "5558:5558"
     restart: unless-stopped
     networks:
       - rede-projeto
