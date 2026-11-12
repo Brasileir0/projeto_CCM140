@@ -56,7 +56,9 @@ int main() {
     std::filesystem::create_directories("data");
     zmq::context_t context(1);
     zmq::socket_t socket(context, zmq::socket_type::rep);
+    zmq::socket_t pub_socket(context, zmq::socket_type::pub);
     socket.bind("tcp://*:5555");
+    pub_socket.connect("tcp://proxy-pubsub:5557");
     std::cout << "[Servidor C++] Iniciado na porta 5555... \n";
 
     while (true) {
@@ -72,9 +74,6 @@ int main() {
         std::string action = req_map["action"];
         std::string request_timestamp = req_map["timestamp"];
         std::map<std::string, std::string> rep_map;
-
-        zmq::socket_t pub_socket(context, zmq::socket_type::pub);
-        pub_socket.connect("tcp://proxy-pubsub:5557");
 
         if (request_timestamp.empty()) {
             rep_map["status"] = "error";
@@ -122,7 +121,7 @@ int main() {
             rep_map["status"] = "success";
             rep_map["channels"] = channel_list;
             std::cout << "[" << request_timestamp << "][CANAIS] Lista enviada: " << channel_list << std::endl;
-        } else if (action == "publish_message") {
+        } else if (action == "publish") {
             std::string channel = trim(req_map["channel"]);
             std::string message = req_map["message"];
             std::string username = req_map["username"];
@@ -132,11 +131,19 @@ int main() {
                 rep_map["status"] = "error";
                 rep_map["message"] = "Canal não existe";
             } else {
-                save_message(channel, username, message, request_timestamp);
+                const std::string publication_timestamp = get_timestamp();
+                save_message(channel, username, message, publication_timestamp);
             
-                std::string payload = username + ": " + message;
+                std::map<std::string, std::string> publication = {
+                    {"channel", channel},
+                    {"message", message},
+                    {"timestamp", publication_timestamp},
+                    {"username", username}
+                };
+                msgpack::sbuffer publication_buffer;
+                msgpack::pack(publication_buffer, publication);
                 zmq::message_t topic_msg(channel.data(), channel.size());
-                zmq::message_t content_msg(payload.data(), payload.size());
+                zmq::message_t content_msg(publication_buffer.data(), publication_buffer.size());
 
                 pub_socket.send(topic_msg, zmq::send_flags::sndmore);
                 pub_socket.send(content_msg, zmq::send_flags::none);
