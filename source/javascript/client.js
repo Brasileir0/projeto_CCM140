@@ -1,5 +1,6 @@
 const zmq = require('zeromq');
 const msgpack = require('msgpack5')();
+let logicalClock = 0;
 
 function getTimestamp() {
     const now = new Date();
@@ -8,8 +9,6 @@ function getTimestamp() {
     ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
 }
 
-// Normaliza os timestamps dos servidores (ISO do Python/JS ou "data hora" do C++)
-// para "AAAA-MM-DD HH:MM:SS".
 function formatTimestamp(timestamp) {
     if (typeof timestamp !== 'string') {
         return 'desconhecido';
@@ -41,11 +40,15 @@ function normalizeChannels(channels) {
 }
 
 async function sendRequest(socket, requestData) {
-    const request = { ...requestData, timestamp: getTimestamp() };
+    logicalClock += 1;
+    const request = { ...requestData, timestamp: getTimestamp(), logical_clock: logicalClock };
     console.log(`[${request.timestamp}][REQ] ${objectToString(request)}`);
     await socket.send(msgpack.encode(request));
     const [replyBuffer] = await socket.receive();
     const response = msgpack.decode(replyBuffer);
+    if (Number.isSafeInteger(response.logical_clock) && response.logical_clock >= 0) {
+        logicalClock = Math.max(logicalClock, response.logical_clock);
+    }
     console.log(`[${formatTimestamp(response.timestamp)}][REP] ${objectToString(response)}`);
     return response;
 }
@@ -66,20 +69,25 @@ async function receivePublications(socket, subscribedChannels) {
         }
 
         const channel = frames[0].toString();
-        // O filtro do ZeroMQ é por prefixo ("canal-a" também casa com "canal-ab").
+
         if (!subscribedChannels.has(channel)) {
             continue;
         }
 
         try {
             const publication = msgpack.decode(frames[1]);
+            if (Number.isSafeInteger(publication.logical_clock) && publication.logical_clock >= 0) {
+                logicalClock = Math.max(logicalClock, publication.logical_clock);
+            }
             console.log(
                 `\n---------- NOVA MENSAGEM ---------\n` +
                 `Canal: ${channel}\n` +
                 (publication.username ? `Autor: ${publication.username}\n` : '') +
                 `Mensagem: ${publication.message}\n` +
                 `Enviada em: ${formatTimestamp(publication.timestamp)}\n` +
+                `Relógio lógico: ${publication.logical_clock ?? 'indisponível'}\n` +
                 `Recebida em: ${getTimestamp()}\n` +
+                `Relógio lógico local: ${logicalClock}\n` +
                 `------------------------------------\n`
             );
         } catch (error) {
@@ -114,7 +122,6 @@ async function main() {
     try {
         console.log(`[Cliente JS] Conectado a ${endpoint} como ${username}`);
 
-        // Em caso de erro, o login é repetido (requisito da parte 1).
         while (true) {
             const login = await sendRequest(requestSocket, { action: 'login', username });
             if (login.status === 'success') {
@@ -125,7 +132,6 @@ async function main() {
         }
 
         while (true) {
-            // 1. Se existirem menos do que 5 canais, cria um novo.
             let channels = await listChannels(requestSocket);
             if (channels.length < 5) {
                 const newChannel = `canal-${username}-${Date.now()}`;
@@ -142,7 +148,6 @@ async function main() {
                 continue;
             }
 
-            // 2. Se estiver inscrito em menos do que 3 canais, inscreve-se em mais um.
             if (subscribedChannels.size < 3) {
                 const candidates = channels.filter((channel) => !subscribedChannels.has(channel));
                 if (candidates.length > 0) {
@@ -153,7 +158,6 @@ async function main() {
                 }
             }
 
-            // 3. Escolhe um canal e envia 10 mensagens com 1 segundo de intervalo.
             const channel = chooseRandom(channels);
             for (let index = 0; index < 10; index += 1) {
                 const message = `Mensagem ${index + 1} de ${username}: ${Math.random().toString(36).slice(2, 10)}`;
