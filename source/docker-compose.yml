@@ -19,6 +19,16 @@ services:
     networks:
       - rede-projeto
 
+  # Serviço de referência (rank, lista de servidores, heartbeat e hora correta)
+  referencia:
+    build:
+      context: ./cpp
+      dockerfile: Dockerfile
+    command: ["./build/referencia"]
+    restart: unless-stopped
+    networks:
+      - rede-projeto
+
   server-python-1:
     build:
       context: ./python
@@ -27,12 +37,15 @@ services:
     environment:
       BROKER_BACKEND: "tcp://broker:5556"
       PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
+      SERVER_NAME: "server-python-1"
+      REFERENCE_ENDPOINT: "tcp://referencia:5559"
     restart: unless-stopped
     volumes:
       - server_python_1_data:/app/data
     depends_on:
       - broker
       - proxy-pubsub
+      - referencia
     networks:
       - rede-projeto
 
@@ -44,12 +57,15 @@ services:
     environment:
       BROKER_BACKEND: "tcp://broker:5556"
       PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
+      SERVER_NAME: "server-python-2"
+      REFERENCE_ENDPOINT: "tcp://referencia:5559"
     restart: unless-stopped
     volumes:
       - server_python_2_data:/app/data
     depends_on:
       - broker
       - proxy-pubsub
+      - referencia
     networks:
       - rede-projeto
 
@@ -61,12 +77,15 @@ services:
     environment:
       BROKER_BACKEND: "tcp://broker:5556"
       PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
+      SERVER_NAME: "server-javascript-1"
+      REFERENCE_ENDPOINT: "tcp://referencia:5559"
     restart: unless-stopped
     volumes:
       - server_javascript_1_data:/app/data
     depends_on:
       - broker
       - proxy-pubsub
+      - referencia
     networks:
       - rede-projeto
 
@@ -78,12 +97,15 @@ services:
     environment:
       BROKER_BACKEND: "tcp://broker:5556"
       PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
+      SERVER_NAME: "server-javascript-2"
+      REFERENCE_ENDPOINT: "tcp://referencia:5559"
     restart: unless-stopped
     volumes:
       - server_javascript_2_data:/app/data
     depends_on:
       - broker
       - proxy-pubsub
+      - referencia
     networks:
       - rede-projeto
 
@@ -95,12 +117,15 @@ services:
     environment:
       BROKER_BACKEND: "tcp://broker:5556"
       PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
+      SERVER_NAME: "server-cpp-1"
+      REFERENCE_ENDPOINT: "tcp://referencia:5559"
     restart: unless-stopped
     volumes:
       - server_cpp_1_data:/app/data
     depends_on:
       - broker
       - proxy-pubsub
+      - referencia
     networks:
       - rede-projeto
 
@@ -112,12 +137,15 @@ services:
     environment:
       BROKER_BACKEND: "tcp://broker:5556"
       PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
+      SERVER_NAME: "server-cpp-2"
+      REFERENCE_ENDPOINT: "tcp://referencia:5559"
     restart: unless-stopped
     volumes:
       - server_cpp_2_data:/app/data
     depends_on:
       - broker
       - proxy-pubsub
+      - referencia
     networks:
       - rede-projeto
 
