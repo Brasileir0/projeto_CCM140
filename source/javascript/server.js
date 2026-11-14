@@ -46,9 +46,17 @@ function loadChannels() {
 async function main() {
     const replySocket = new zmq.Reply();
     const publisher = new zmq.Publisher();
-    await replySocket.bind(process.env.SERVER_ENDPOINT || 'tcp://*:5555');
+    // Com BROKER_BACKEND definido, o servidor conecta no DEALER do broker;
+    // sem ele, atende os clientes diretamente na porta 5555.
+    if (process.env.BROKER_BACKEND) {
+        replySocket.connect(process.env.BROKER_BACKEND);
+        console.log(`[Servidor JS] Conectado ao broker em ${process.env.BROKER_BACKEND}`);
+    } else {
+        await replySocket.bind(process.env.SERVER_ENDPOINT || 'tcp://*:5555');
+        console.log('[Servidor JS] Req-Rep ativo na porta 5555.');
+    }
     publisher.connect(process.env.PUBSUB_XSUB_ENDPOINT || 'tcp://proxy-pubsub:5557');
-    console.log('[Servidor JS] Req-Rep ativo na porta 5555; Pub conectado ao proxy.');
+    console.log('[Servidor JS] Publisher conectado ao proxy Pub/Sub');
 
     for await (const [requestBuffer] of replySocket) {
         const receivedAt = getTimestamp();
@@ -102,10 +110,13 @@ async function main() {
                     if (!channel || !message.trim()) {
                         response = { status: 'error', message: 'Canal ou mensagem inválidos' };
                         console.log(`[${request.timestamp}][PUB ERRO] Canal ou mensagem inválidos`);
-                    } else if (!loadChannels().has(channel)) {
-                        response = { status: 'error', message: 'Canal não existe' };
-                        console.log(`[${request.timestamp}][PUB ERRO] Canal não existe: ${channel}`);
                     } else {
+                        // Com o broker, o canal pode ter sido criado em outro servidor;
+                        // ele passa a ser registrado também neste.
+                        if (!loadChannels().has(channel)) {
+                            saveChannel(channel, request.timestamp);
+                            console.log(`[${request.timestamp}][CHANNEL] Canal registrado a partir de publicação: ${channel}`);
+                        }
                         const publication = {
                             channel,
                             message,

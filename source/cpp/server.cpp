@@ -128,11 +128,13 @@ std::map<std::string, std::string> handle_request(std::map<std::string, std::str
             rep_map["status"] = "error";
             rep_map["message"] = "Canal ou mensagem inválidos";
             std::cout << "[" << request_timestamp << "][PUB ERRO] Canal ou mensagem inválidos" << std::endl;
-        } else if (channels.find(channel) == channels.end()) {
-            rep_map["status"] = "error";
-            rep_map["message"] = "Canal não existe";
-            std::cout << "[" << request_timestamp << "][PUB ERRO] Canal não existe: " << channel << std::endl;
         } else {
+            // Com o broker, o canal pode ter sido criado em outro servidor;
+            // ele passa a ser registrado também neste.
+            if (channels.find(channel) == channels.end()) {
+                save_channel(channel);
+                std::cout << "[" << request_timestamp << "][CHANNEL] Canal registrado a partir de publicação: " << channel << std::endl;
+            }
             const std::string publication_timestamp = get_timestamp();
             save_message(channel, username, message, request_timestamp, publication_timestamp);
 

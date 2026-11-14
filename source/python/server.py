@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+import os
 import msgpack
 import zmq
 import json
@@ -92,12 +93,12 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
         channel = channel.strip()
         channels = load_channels()
 
+        # Com o broker, o canal pode ter sido criado em outro servidor;
+        # ele passa a ser registrado também neste.
         if channel not in channels:
-            print(f"[{timestamp}][PUB ERRO] Canal não existe: {channel}", flush=True)
-            return{
-                "status": "error",
-                "message": "Canal inválido"
-            }
+            with CHANNELS_FILE.open("a", encoding="utf-8") as channel_file:
+                channel_file.write(f"{channel}\n")
+            print(f"[{timestamp}][CHANNEL] Canal registrado a partir de publicação: {channel}", flush=True)
 
         publication = {
             "channel": channel,
@@ -137,13 +138,19 @@ def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     context = zmq.Context()
     socket = context.socket(zmq.REP)
-    socket.bind("tcp://*:5555")
+    # Com BROKER_BACKEND definido, o servidor conecta no DEALER do broker;
+    # sem ele, atende os clientes diretamente na porta 5555.
+    broker_backend = os.environ.get("BROKER_BACKEND")
+    if broker_backend:
+        socket.connect(broker_backend)
+        print(f"[Servidor Python] Conectado ao broker em {broker_backend}", flush=True)
+    else:
+        socket.bind("tcp://*:5555")
+        print("[Servidor Python] Iniciado na porta 5555...", flush=True)
 
     publisher = context.socket(zmq.PUB)
-    publisher.connect("tcp://proxy-pubsub:5557")
-
-    print("[Servidor Python] Iniciado na porta 5555...", flush=True)
-    print("[Servidor Python] Publisher conectado na porta 5557", flush=True)
+    publisher.connect(os.environ.get("PUBSUB_XSUB_ENDPOINT", "tcp://proxy-pubsub:5557"))
+    print("[Servidor Python] Publisher conectado ao proxy Pub/Sub", flush=True)
 
     try:
         while True:
