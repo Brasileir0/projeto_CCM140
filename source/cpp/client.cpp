@@ -62,14 +62,88 @@ void log_output(std::ostream& stream, const std::string& text) {
     stream << text << std::endl;
 }
 
+// Relógio lógico (Lamport). As duas threads mexem nele, então fica protegido por mutex.
+std::mutex clock_mutex;
+long long logical_clock = 0;
+
+// Incrementa o relógio lógico antes de enviar uma mensagem.
+long long tick() {
+    std::lock_guard<std::mutex> lock(clock_mutex);
+    return ++logical_clock;
+}
+
+// Ao receber, fica com o maior valor entre o local e o recebido.
+long long update_clock(const std::map<std::string, std::string>& message) {
+    std::lock_guard<std::mutex> lock(clock_mutex);
+    const auto clock = message.find("logical_clock");
+    if (clock != message.end()) {
+        try {
+            logical_clock = std::max(logical_clock, std::stoll(clock->second));
+        } catch (const std::exception&) {
+        }
+    }
+    return logical_clock;
+}
+
+// As mensagens podem trazer valores de outros tipos além de texto (por exemplo,
+// logical_clock é um número), então cada valor é convertido para texto.
+std::string value_to_string(const msgpack::object& value) {
+    switch (value.type) {
+        case msgpack::type::STR:
+            return std::string(value.via.str.ptr, value.via.str.size);
+        case msgpack::type::BIN:
+            return std::string(value.via.bin.ptr, value.via.bin.size);
+        case msgpack::type::POSITIVE_INTEGER:
+            return std::to_string(value.via.u64);
+        case msgpack::type::NEGATIVE_INTEGER:
+            return std::to_string(value.via.i64);
+        case msgpack::type::FLOAT32:
+        case msgpack::type::FLOAT64:
+            return std::to_string(value.via.f64);
+        case msgpack::type::BOOLEAN:
+            return value.via.boolean ? "true" : "false";
+        default:
+            return "";
+    }
+}
+
+std::map<std::string, std::string> decode_message(const char* data, std::size_t size) {
+    msgpack::object_handle handle = msgpack::unpack(data, size);
+    const msgpack::object& object = handle.get();
+    if (object.type != msgpack::type::MAP) {
+        throw std::runtime_error("a mensagem não é um mapa");
+    }
+    std::map<std::string, std::string> fields;
+    for (uint32_t i = 0; i < object.via.map.size; ++i) {
+        fields[value_to_string(object.via.map.ptr[i].key)] = value_to_string(object.via.map.ptr[i].val);
+    }
+    return fields;
+}
+
+// Empacota os campos de texto e o logical_clock como número inteiro.
+msgpack::sbuffer encode_message(std::map<std::string, std::string> fields, long long clock) {
+    fields.erase("logical_clock");
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> packer(&buffer);
+    packer.pack_map(static_cast<uint32_t>(fields.size() + 1));
+    for (const auto& [key, value] : fields) {
+        packer.pack(key);
+        packer.pack(value);
+    }
+    packer.pack(std::string("logical_clock"));
+    packer.pack(clock);
+    return buffer;
+}
+
 std::map<std::string, std::string> send_request(
     zmq::socket_t& socket,
     std::map<std::string, std::string> request) {
     request["timestamp"] = get_timestamp();
-    log_output(std::cout, "[" + request["timestamp"] + "][REQ] " + map_to_string(request));
+    const long long clock = tick();
+    log_output(std::cout, "[" + request["timestamp"] + "][REQ] " + map_to_string(request) +
+                              " | logical_clock: " + std::to_string(clock));
 
-    msgpack::sbuffer buffer;
-    msgpack::pack(buffer, request);
+    msgpack::sbuffer buffer = encode_message(request, clock);
     zmq::message_t message(buffer.data(), buffer.size());
     if (!socket.send(message, zmq::send_flags::none)) {
         throw std::runtime_error("Falha ao enviar requisição ao servidor.");
@@ -80,10 +154,9 @@ std::map<std::string, std::string> send_request(
         throw std::runtime_error("Falha ao receber resposta do servidor.");
     }
 
-    msgpack::object_handle handle =
-        msgpack::unpack(static_cast<const char*>(reply.data()), reply.size());
-    std::map<std::string, std::string> response;
-    handle.get().convert(response);
+    std::map<std::string, std::string> response =
+        decode_message(static_cast<const char*>(reply.data()), reply.size());
+    update_clock(response);
     const auto response_timestamp = response.find("timestamp");
     const std::string displayed_timestamp =
         response_timestamp == response.end() ? get_timestamp()
@@ -171,11 +244,10 @@ void subscriber_loop(const std::string& endpoint) {
         }
 
         try {
-            msgpack::object_handle handle = msgpack::unpack(
+            std::map<std::string, std::string> publication = decode_message(
                 static_cast<const char*>(publication_frame.data()),
                 publication_frame.size());
-            std::map<std::string, std::string> publication;
-            handle.get().convert(publication);
+            const long long local_clock = update_clock(publication);
             std::ostringstream block;
             block << "\n-------- NOVA MENSAGEM ----------\n"
                   << "Canal: " << channel << "\n";
@@ -186,6 +258,9 @@ void subscriber_loop(const std::string& endpoint) {
                   << "Enviada em: "
                   << format_timestamp(publication["timestamp"]) << "\n"
                   << "Recebida em: " << get_timestamp() << "\n"
+                  << "Relógio lógico: "
+                  << (publication.count("logical_clock") ? publication["logical_clock"] : "indisponível")
+                  << " (local após receber: " << local_clock << ")\n"
                   << "-----------------------------------\n";
             log_output(std::cout, block.str());
         } catch (const std::exception& error) {
