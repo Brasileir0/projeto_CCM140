@@ -6,6 +6,7 @@
   "scripts": {
     "start:client": "node client.js",
     "start:server": "node server.js",
+    "start:reference": "node reference.js",
     "start:broker": "node broker.js",
     "start:proxy-pubsub": "node proxy_pubsub.js"
   },
