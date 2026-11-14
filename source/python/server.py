@@ -12,6 +12,9 @@ EVENTS_FILE = DATA_DIR / "events.jsonl"
 def get_timestamp() -> str:
     return datetime.now().astimezone().isoformat()
 
+def dict_to_string(values: dict) -> str:
+    return "{ " + " | ".join(f"{key}: {values[key]}" for key in sorted(values)) + " }"
+
 def load_channels() -> set[str]:
     if not CHANNELS_FILE.exists():
         return set()
@@ -33,7 +36,7 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
         if not isinstance(username, str) or not username.strip():
             print(f"[{get_timestamp()}][LOGIN ERRO] Nome inválido", flush=True)
             return {"status": "error", "message": "Nome de usuário inválido"}
-        
+
         username = username.strip()
 
         with USERS_FILE.open("a", encoding="utf-8") as users:
@@ -48,14 +51,14 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
         if not isinstance(channel, str) or not channel.strip():
             print(f"[{get_timestamp()}][CANAL ERRO] Nome inválido", flush=True)
             return {"status": "error", "message": "Nome de canal inválido"}
-        
+
         channel = channel.strip()
         channels = load_channels()
 
         if channel in channels:
             print(f"[{timestamp}][CANAL ERRO] Canal já existe: {channel}", flush=True)
             return {"status": "error", "message": "Canal já existe"}
-        
+
         with CHANNELS_FILE.open("a", encoding="utf-8") as channel_file:
             channel_file.write(f"{channel}\n")
 
@@ -70,14 +73,17 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
     if action == "publish":
         channel = request.get("channel")
         message = request.get("message")
+        username = request.get("username")
 
         if not isinstance(channel, str) or not channel.strip():
+            print(f"[{timestamp}][PUB ERRO] Nome de canal inválido", flush=True)
             return{
                 "status": "error",
                 "message": "Nome de canal inválido"
             }
 
         if not isinstance(message, str) or not message.strip():
+            print(f"[{timestamp}][PUB ERRO] Mensagem inválida ou vazia", flush=True)
             return{
                     "status": "error",
                     "message": "Mensagem inválida ou vazia"
@@ -87,6 +93,7 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
         channels = load_channels()
 
         if channel not in channels:
+            print(f"[{timestamp}][PUB ERRO] Canal não existe: {channel}", flush=True)
             return{
                 "status": "error",
                 "message": "Canal inválido"
@@ -97,6 +104,8 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
             "message": message,
             "timestamp": get_timestamp()
         }
+        if isinstance(username, str) and username.strip():
+            publication["username"] = username.strip()
 
         persist_event({
             "type": "publication",
@@ -109,13 +118,13 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
             msgpack.packb(publication, use_bin_type=True)
         ])
 
-        print(f"[{publication['timestamp']}][PUB]"f"Canal: {channel} | Mensagem: {message}",flush=True)
+        print(f"[{publication['timestamp']}][PUB] {dict_to_string(publication)}", flush=True)
 
         return{
             "status": "success",
             "message": "Mensagem publicada"
         }
-    
+
 
     print(f"[{timestamp}][ERRO] Ação desconhecida: {action}", flush=True)
     return {"status": "error", "message": "Ação desconhecida"}
@@ -138,8 +147,13 @@ def main() -> None:
 
     try:
         while True:
-            request = msgpack.unpackb(socket.recv(), raw=False)
+            raw_request = socket.recv()
             received_at = get_timestamp()
+            try:
+                request = msgpack.unpackb(raw_request, raw=False)
+            except Exception as error:
+                print(f"[{received_at}][ERRO] Requisição inválida: {error}", flush=True)
+                request = None
             persist_event({
                 "type": "request",
                 "received_at": received_at,
@@ -148,6 +162,7 @@ def main() -> None:
             if not isinstance(request, dict):
                 response = {"status": "error", "message": "Requisição inválida"}
             else:
+                print(f"[{received_at}][RECEBIDO] {dict_to_string(request)}", flush=True)
                 response = handle_request(request, publisher)
             response["timestamp"] = get_timestamp()
             persist_event({
@@ -155,6 +170,7 @@ def main() -> None:
                 "timestamp": response["timestamp"],
                 "response": response
             })
+            print(f"[{response['timestamp']}][ENVIADO] {dict_to_string(response)}", flush=True)
             socket.send(msgpack.packb(response, use_bin_type=True))
     finally:
         socket.close()

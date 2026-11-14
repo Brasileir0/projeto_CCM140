@@ -54,12 +54,19 @@ std::string map_to_string(const std::map<std::string, std::string>& values) {
 std::mutex subscription_mutex;
 std::queue<std::string> pending_subscriptions;
 
+// As duas threads escrevem na tela; o mutex evita que as linhas se misturem.
+std::mutex output_mutex;
+
+void log_output(std::ostream& stream, const std::string& text) {
+    std::lock_guard<std::mutex> lock(output_mutex);
+    stream << text << std::endl;
+}
+
 std::map<std::string, std::string> send_request(
     zmq::socket_t& socket,
     std::map<std::string, std::string> request) {
     request["timestamp"] = get_timestamp();
-    std::cout << "[" << request["timestamp"] << "][REQ] "
-              << map_to_string(request) << std::endl;
+    log_output(std::cout, "[" + request["timestamp"] + "][REQ] " + map_to_string(request));
 
     msgpack::sbuffer buffer;
     msgpack::pack(buffer, request);
@@ -81,8 +88,7 @@ std::map<std::string, std::string> send_request(
     const std::string displayed_timestamp =
         response_timestamp == response.end() ? get_timestamp()
                                              : format_timestamp(response_timestamp->second);
-    std::cout << "[" << displayed_timestamp << "][REP] "
-              << map_to_string(response) << std::endl;
+    log_output(std::cout, "[" + displayed_timestamp + "][REP] " + map_to_string(response));
     return response;
 }
 
@@ -135,8 +141,7 @@ void subscriber_loop(const std::string& endpoint) {
                 pending_subscriptions.pop();
                 subscriber.set(zmq::sockopt::subscribe, channel);
                 subscribed_channels.insert(channel);
-                std::cout << "[" << get_timestamp() << "][SUB] Inscrito no canal: "
-                          << channel << std::endl;
+                log_output(std::cout, "[" + get_timestamp() + "][SUB] Inscrito no canal: " + channel);
             }
         }
 
@@ -154,7 +159,7 @@ void subscriber_loop(const std::string& endpoint) {
         }
         if (!topic_frame.more() ||
             !subscriber.recv(publication_frame, zmq::recv_flags::none)) {
-            std::cerr << "[SUB][ERRO] Formato de publicação inválido" << std::endl;
+            log_output(std::cerr, "[SUB][ERRO] Formato de publicação inválido");
             continue;
         }
 
@@ -171,20 +176,20 @@ void subscriber_loop(const std::string& endpoint) {
                 publication_frame.size());
             std::map<std::string, std::string> publication;
             handle.get().convert(publication);
-            std::cout << "\n-------- NOVA MENSAGEM ----------\n"
-                      << "Canal: " << channel << "\n";
+            std::ostringstream block;
+            block << "\n-------- NOVA MENSAGEM ----------\n"
+                  << "Canal: " << channel << "\n";
             if (publication.count("username")) {
-                std::cout << "Autor: " << publication["username"] << "\n";
+                block << "Autor: " << publication["username"] << "\n";
             }
-            std::cout << "Mensagem: " << publication["message"] << "\n"
-                      << "Enviada em: "
-                      << format_timestamp(publication["timestamp"]) << "\n"
-                      << "Recebida em: " << get_timestamp() << "\n"
-                      << "-----------------------------------\n"
-                      << std::endl;
+            block << "Mensagem: " << publication["message"] << "\n"
+                  << "Enviada em: "
+                  << format_timestamp(publication["timestamp"]) << "\n"
+                  << "Recebida em: " << get_timestamp() << "\n"
+                  << "-----------------------------------\n";
+            log_output(std::cout, block.str());
         } catch (const std::exception& error) {
-            std::cerr << "[SUB][ERRO] Publicação inválida: "
-                      << error.what() << std::endl;
+            log_output(std::cerr, std::string("[SUB][ERRO] Publicação inválida: ") + error.what());
         }
     }
 }
@@ -253,14 +258,12 @@ int main() {
                 if (is_success(created)) {
                     channels = list_channels(request_socket);
                 } else {
-                    std::cerr << "[Cliente C++] Não foi possível criar o canal "
-                              << new_channel << ": " << response_message(created)
-                              << std::endl;
+                    log_output(std::cerr, "[Cliente C++] Não foi possível criar o canal " +
+                                              new_channel + ": " + response_message(created));
                 }
             }
             if (channels.empty()) {
-                std::cerr << "[Cliente C++] Nenhum canal disponível, tentando novamente..."
-                          << std::endl;
+                log_output(std::cerr, "[Cliente C++] Nenhum canal disponível, tentando novamente...");
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 continue;
             }
@@ -301,8 +304,7 @@ int main() {
                      {"message", message},
                      {"username", username}});
                 if (!is_success(response)) {
-                    std::cerr << "[ERRO PUBLICAÇÃO] " << response_message(response)
-                              << std::endl;
+                    log_output(std::cerr, "[ERRO PUBLICAÇÃO] " + response_message(response));
                 }
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
