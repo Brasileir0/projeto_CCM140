@@ -5,15 +5,21 @@ function getTimestamp() {
     const now = new Date();
     const pad = (value) => String(value).padStart(2, '0');
     return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
-    ` ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+    ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
 }
 
+// Normaliza os timestamps dos servidores (ISO do Python/JS ou "data hora" do C++)
+// para "AAAA-MM-DD HH:MM:SS".
 function formatTimestamp(timestamp) {
     if (typeof timestamp !== 'string') {
         return 'desconhecido';
     }
-    const match = timestamp.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/);
+    const match = timestamp.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
     return match ? `${match[1]} ${match[2]}` : timestamp;
+}
+
+function objectToString(values) {
+    return `{ ${Object.keys(values).sort().map((key) => `${key}: ${values[key]}`).join(' | ')} }`;
 }
 
 function delay(milliseconds) {
@@ -36,22 +42,31 @@ function normalizeChannels(channels) {
 
 async function sendRequest(socket, requestData) {
     const request = { ...requestData, timestamp: getTimestamp() };
-    console.log(`[${formatTimestamp(request.timestamp)}][REQ] ${request.action}`);
+    console.log(`[${request.timestamp}][REQ] ${objectToString(request)}`);
     await socket.send(msgpack.encode(request));
     const [replyBuffer] = await socket.receive();
     const response = msgpack.decode(replyBuffer);
-    console.log(`[${formatTimestamp(response.timestamp)}][REP] ${response.message || response.status}`);
+    console.log(`[${formatTimestamp(response.timestamp)}][REP] ${objectToString(response)}`);
     return response;
+}
+
+async function listChannels(socket) {
+    const response = await sendRequest(socket, { action: 'list_channels' });
+    if (response.status !== 'success') {
+        throw new Error(`Não foi possível listar canais: ${response.message}`);
+    }
+    return normalizeChannels(response.channels);
 }
 
 async function receivePublications(socket, subscribedChannels) {
     for await (const frames of socket) {
         if (frames.length < 2) {
-            console.error('[Cliente JS] Mensagem Pub/Sub incompleta recebida.');
+            console.error('[SUB][ERRO] Formato de publicação inválido');
             continue;
         }
 
         const channel = frames[0].toString();
+        // O filtro do ZeroMQ é por prefixo ("canal-a" também casa com "canal-ab").
         if (!subscribedChannels.has(channel)) {
             continue;
         }
@@ -61,34 +76,16 @@ async function receivePublications(socket, subscribedChannels) {
             console.log(
                 `\n---------- NOVA MENSAGEM ---------\n` +
                 `Canal: ${channel}\n` +
+                (publication.username ? `Autor: ${publication.username}\n` : '') +
                 `Mensagem: ${publication.message}\n` +
                 `Enviada em: ${formatTimestamp(publication.timestamp)}\n` +
-                `Recebida em: ${formatTimestamp(getTimestamp())}\n` +
+                `Recebida em: ${getTimestamp()}\n` +
                 `------------------------------------\n`
             );
         } catch (error) {
-            console.error(`[Cliente JS] Publicação inválida no canal ${channel}:`, error);
+            console.error(`[SUB][ERRO] Publicação inválida no canal ${channel}:`, error);
         }
     }
-}
-
-async function ensureChannel(socket, channels, username) {
-    channels = normalizeChannels(channels);
-    if (channels.length >= 5) {
-        return channels;
-    }
-
-    const channel = `canal-${username}-${Date.now()}`;
-    const response = await sendRequest(socket, { action: 'create_channel', channel });
-    if (response.status !== 'success') {
-        throw new Error(`Não foi possível criar o canal ${channel}: ${response.message}`);
-    }
-
-    const updated = await sendRequest(socket, { action: 'list_channels' });
-    if (updated.status !== 'success') {
-        throw new Error('Não foi possível atualizar a lista de canais.');
-    }
-    return normalizeChannels(updated.channels);
 }
 
 async function main() {
@@ -116,42 +113,58 @@ async function main() {
 
     try {
         console.log(`[Cliente JS] Conectado a ${endpoint} como ${username}`);
-        const login = await sendRequest(requestSocket, { action: 'login', username });
-        if (login.status !== 'success') {
-            throw new Error(`Login falhou: ${login.message}`);
-        }
 
-        const channelList = await sendRequest(requestSocket, { action: 'list_channels' });
-        if (channelList.status !== 'success') {
-            throw new Error(`Não foi possível listar canais: ${channelList.message}`);
+        // Em caso de erro, o login é repetido (requisito da parte 1).
+        while (true) {
+            const login = await sendRequest(requestSocket, { action: 'login', username });
+            if (login.status === 'success') {
+                break;
+            }
+            console.error(`[Cliente JS] Login falhou: ${login.message}. Tentando novamente...`);
+            await delay(1000);
         }
-        let channels = normalizeChannels(channelList.channels);
-        channels = await ensureChannel(requestSocket, channels, username);
-        if (channels.length === 0) {
-            throw new Error('O servidor não retornou canais disponíveis.');
-        }
-
-        const subscriptions = [...channels]
-            .sort(() => Math.random() - 0.5)
-            .slice(0, Math.min(3, channels.length));
-        for (const channel of subscriptions) {
-            subscribedChannels.add(channel);
-            subscriber.subscribe(channel);
-            console.log(`[Cliente JS] Inscrito no canal ${channel}`);
-        }
-        await delay(250);
 
         while (true) {
+            // 1. Se existirem menos do que 5 canais, cria um novo.
+            let channels = await listChannels(requestSocket);
+            if (channels.length < 5) {
+                const newChannel = `canal-${username}-${Date.now()}`;
+                const created = await sendRequest(requestSocket, { action: 'create_channel', channel: newChannel });
+                if (created.status === 'success') {
+                    channels = await listChannels(requestSocket);
+                } else {
+                    console.error(`[Cliente JS] Não foi possível criar o canal ${newChannel}: ${created.message}`);
+                }
+            }
+            if (channels.length === 0) {
+                console.error('[Cliente JS] Nenhum canal disponível, tentando novamente...');
+                await delay(1000);
+                continue;
+            }
+
+            // 2. Se estiver inscrito em menos do que 3 canais, inscreve-se em mais um.
+            if (subscribedChannels.size < 3) {
+                const candidates = channels.filter((channel) => !subscribedChannels.has(channel));
+                if (candidates.length > 0) {
+                    const channel = chooseRandom(candidates);
+                    subscribedChannels.add(channel);
+                    subscriber.subscribe(channel);
+                    console.log(`[${getTimestamp()}][SUB] Inscrito no canal: ${channel}`);
+                }
+            }
+
+            // 3. Escolhe um canal e envia 10 mensagens com 1 segundo de intervalo.
             const channel = chooseRandom(channels);
             for (let index = 0; index < 10; index += 1) {
                 const message = `Mensagem ${index + 1} de ${username}: ${Math.random().toString(36).slice(2, 10)}`;
                 const response = await sendRequest(requestSocket, {
                     action: 'publish',
                     channel,
-                    message
+                    message,
+                    username
                 });
                 if (response.status !== 'success') {
-                    console.error(`[Cliente JS] Publicação falhou: ${response.message}`);
+                    console.error(`[ERRO PUBLICAÇÃO] ${response.message}`);
                 }
                 await delay(1000);
             }

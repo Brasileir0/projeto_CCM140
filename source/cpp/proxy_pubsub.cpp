@@ -9,8 +9,8 @@ int main() {
     xsub.bind("tcp://*:5557");
     xpub.bind("tcp://*:5558");
 
-    std::cout << "[PROXY Pub/Sub] XSUB ativo na porta 5557, XPUB ativo na porta 5558";
-    
+    std::cout << "[PROXY Pub/Sub] XSUB ativo na porta 5557, XPUB ativo na porta 5558" << std::endl;
+
     zmq::proxy(xsub, xpub);
     return 0;
 }

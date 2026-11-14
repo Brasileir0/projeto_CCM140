@@ -1,14 +1,38 @@
-version: '3.8'
-
 services:
+  # Broker Req-Rep (ROUTER 5555 para os clientes, DEALER 5556 para os servidores)
+  broker:
+    build:
+      context: ./cpp
+      dockerfile: Dockerfile
+    command: ["./build/broker"]
+    restart: unless-stopped
+    networks:
+      - rede-projeto
+
+  # Proxy Pub/Sub (XSUB 5557 para os servidores, XPUB 5558 para os clientes)
+  proxy-pubsub:
+    build:
+      context: ./javascript
+      dockerfile: Dockerfile
+    command: ["node", "proxy_pubsub.js"]
+    restart: unless-stopped
+    networks:
+      - rede-projeto
+
   server-python-1:
     build:
       context: ./python
       dockerfile: Dockerfile
     command: ["python", "server.py"]
+    environment:
+      BROKER_BACKEND: "tcp://broker:5556"
+      PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
     restart: unless-stopped
     volumes:
       - server_python_1_data:/app/data
+    depends_on:
+      - broker
+      - proxy-pubsub
     networks:
       - rede-projeto
 
@@ -17,9 +41,83 @@ services:
       context: ./python
       dockerfile: Dockerfile
     command: ["python", "server.py"]
+    environment:
+      BROKER_BACKEND: "tcp://broker:5556"
+      PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
     restart: unless-stopped
     volumes:
       - server_python_2_data:/app/data
+    depends_on:
+      - broker
+      - proxy-pubsub
+    networks:
+      - rede-projeto
+
+  server-javascript-1:
+    build:
+      context: ./javascript
+      dockerfile: Dockerfile
+    command: ["node", "server.js"]
+    environment:
+      BROKER_BACKEND: "tcp://broker:5556"
+      PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
+    restart: unless-stopped
+    volumes:
+      - server_javascript_1_data:/app/data
+    depends_on:
+      - broker
+      - proxy-pubsub
+    networks:
+      - rede-projeto
+
+  server-javascript-2:
+    build:
+      context: ./javascript
+      dockerfile: Dockerfile
+    command: ["node", "server.js"]
+    environment:
+      BROKER_BACKEND: "tcp://broker:5556"
+      PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
+    restart: unless-stopped
+    volumes:
+      - server_javascript_2_data:/app/data
+    depends_on:
+      - broker
+      - proxy-pubsub
+    networks:
+      - rede-projeto
+
+  server-cpp-1:
+    build:
+      context: ./cpp
+      dockerfile: Dockerfile
+    command: ["./build/server"]
+    environment:
+      BROKER_BACKEND: "tcp://broker:5556"
+      PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
+    restart: unless-stopped
+    volumes:
+      - server_cpp_1_data:/app/data
+    depends_on:
+      - broker
+      - proxy-pubsub
+    networks:
+      - rede-projeto
+
+  server-cpp-2:
+    build:
+      context: ./cpp
+      dockerfile: Dockerfile
+    command: ["./build/server"]
+    environment:
+      BROKER_BACKEND: "tcp://broker:5556"
+      PUBSUB_XSUB_ENDPOINT: "tcp://proxy-pubsub:5557"
+    restart: unless-stopped
+    volumes:
+      - server_cpp_2_data:/app/data
+    depends_on:
+      - broker
+      - proxy-pubsub
     networks:
       - rede-projeto
 
@@ -30,14 +128,10 @@ services:
     command: ["python", "client.py"]
     environment:
       BOT_NAME: "PYTHON-1"
-      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
+      SERVER_ENDPOINTS: "tcp://broker:5555"
+      PUBSUB_XPUB_ENDPOINT: "tcp://proxy-pubsub:5558"
     depends_on:
-      - server-python-1
-      - server-python-2
-      - server-javascript-1
-      - server-javascript-2
-      - server-cpp-1
-      - server-cpp-2
+      - broker
       - proxy-pubsub
     networks:
       - rede-projeto
@@ -49,40 +143,10 @@ services:
     command: ["python", "client.py"]
     environment:
       BOT_NAME: "PYTHON-2"
-      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
+      SERVER_ENDPOINTS: "tcp://broker:5555"
+      PUBSUB_XPUB_ENDPOINT: "tcp://proxy-pubsub:5558"
     depends_on:
-      - server-python-1
-      - server-python-2
-      - server-javascript-1
-      - server-javascript-2
-      - server-cpp-1
-      - server-cpp-2
-      - proxy-pubsub
-    networks:
-      - rede-projeto
-
-  server-javascript-1:
-    build:
-      context: ./javascript
-      dockerfile: Dockerfile
-    command: ["node", "server.js"]
-    restart: unless-stopped
-    volumes:
-      - server_javascript_1_data:/app/data
-    depends_on:
-      - proxy-pubsub
-    networks:
-      - rede-projeto
-
-  server-javascript-2:
-    build:
-      context: ./javascript
-      dockerfile: Dockerfile
-    command: ["node", "server.js"]
-    restart: unless-stopped
-    volumes:
-      - server_javascript_2_data:/app/data
-    depends_on:
+      - broker
       - proxy-pubsub
     networks:
       - rede-projeto
@@ -93,11 +157,11 @@ services:
       dockerfile: Dockerfile
     command: ["node", "client.js"]
     environment:
-      SERVER_ENDPOINTS: "tcp://server-javascript-1:5555"
       BOT_NAME: "JAVASCRIPT-1"
+      SERVER_ENDPOINTS: "tcp://broker:5555"
+      PUBSUB_XPUB_ENDPOINT: "tcp://proxy-pubsub:5558"
     depends_on:
-      - server-javascript-1
-      - server-javascript-2
+      - broker
       - proxy-pubsub
     networks:
       - rede-projeto
@@ -108,34 +172,12 @@ services:
       dockerfile: Dockerfile
     command: ["node", "client.js"]
     environment:
-      SERVER_ENDPOINTS: "tcp://server-javascript-1:5555"
       BOT_NAME: "JAVASCRIPT-2"
+      SERVER_ENDPOINTS: "tcp://broker:5555"
+      PUBSUB_XPUB_ENDPOINT: "tcp://proxy-pubsub:5558"
     depends_on:
-      - server-javascript-1
-      - server-javascript-2
+      - broker
       - proxy-pubsub
-    networks:
-      - rede-projeto
-
-  server-cpp-1:
-    build:
-      context: ./cpp
-      dockerfile: Dockerfile
-    command: ["./build/server"]
-    restart: unless-stopped
-    volumes:
-      - server_cpp_1_data:/app/data
-    networks:
-      - rede-projeto
-
-  server-cpp-2:
-    build:
-      context: ./cpp
-      dockerfile: Dockerfile
-    command: ["./build/server"]
-    restart: unless-stopped
-    volumes:
-      - server_cpp_2_data:/app/data
     networks:
       - rede-projeto
 
@@ -146,14 +188,10 @@ services:
     command: ["./build/client"]
     environment:
       BOT_NAME: "CPP-1"
-      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
+      SERVER_ENDPOINTS: "tcp://broker:5555"
+      PUBSUB_XPUB_ENDPOINT: "tcp://proxy-pubsub:5558"
     depends_on:
-      - server-python-1
-      - server-python-2
-      - server-javascript-1
-      - server-javascript-2
-      - server-cpp-1
-      - server-cpp-2
+      - broker
       - proxy-pubsub
     networks:
       - rede-projeto
@@ -165,54 +203,11 @@ services:
     command: ["./build/client"]
     environment:
       BOT_NAME: "CPP-2"
-      SERVER_ENDPOINTS: "tcp://server-python-1:5555,tcp://server-python-2:5555,tcp://server-javascript-1:5555,tcp://server-javascript-2:5555,tcp://server-cpp-1:5555,tcp://server-cpp-2:5555"
+      SERVER_ENDPOINTS: "tcp://broker:5555"
+      PUBSUB_XPUB_ENDPOINT: "tcp://proxy-pubsub:5558"
     depends_on:
-      - server-python-1
-      - server-python-2
-      - server-javascript-1
-      - server-javascript-2
-      - server-cpp-1
-      - server-cpp-2
+      - broker
       - proxy-pubsub
-    networks:
-      - rede-projeto
-
-  proxy-pubsub:
-    build:
-      context: ./javascript
-      dockerfile: Dockerfile
-    command: ["node", "proxy_pubsub.js"]
-    ports:
-      - "5557:5557"
-      - "5558:5558"
-    restart: unless-stopped
-    networks:
-      - rede-projeto
-
-  proxy-pubsub-js:
-    build:
-      context: ./javascript
-      dockerfile: Dockerfile
-    command: ["node", "proxy_pubsub.js"]
-    restart: unless-stopped
-    networks:
-      - rede-projeto
-
-  proxy-pubsub-py:
-    build:
-      context: ./python
-      dockerfile: Dockerfile
-    command: ["python", "proxy_pubsub.py"]
-    restart: unless-stopped
-    networks:
-      - rede-projeto
-
-  proxy-pubsub-cpp:
-    build:
-      context: ./cpp
-      dockerfile: Dockerfile
-    command: ["./build/proxy_pubsub"]
-    restart: unless-stopped
     networks:
       - rede-projeto
 
