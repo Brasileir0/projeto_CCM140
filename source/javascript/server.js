@@ -9,8 +9,18 @@ const CHANNELS_FILE = path.join(DATA_DIR, 'channels.txt');
 const EVENTS_FILE = path.join(DATA_DIR, 'events.jsonl');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
+let logicalClock = 0;
+let physicalClockOffset = 0;
+let clientMessagesReceived = 0;
+
 function getTimestamp() {
-    return new Date().toISOString();
+    return new Date(Date.now() + physicalClockOffset).toISOString();
+}
+
+function observeLogicalClock(value) {
+    if (Number.isSafeInteger(value) && value >= 0) {
+        logicalClock = Math.max(logicalClock, value);
+    }
 }
 
 function objectToString(values) {
@@ -43,11 +53,46 @@ function loadChannels() {
     );
 }
 
+async function callReference(action, extra = {}) {
+    const endpoint = process.env.REFERENCE_ENDPOINT;
+    if (!endpoint) {
+        return null;
+    }
+
+    const socket = new zmq.Request();
+    socket.receiveTimeout = Number(process.env.REFERENCE_TIMEOUT_MS) || 2000;
+    logicalClock += 1;
+    const request = {
+        action,
+        ...extra,
+        timestamp: getTimestamp(),
+        logical_clock: logicalClock
+    };
+    
+    try {
+        socket.connect(endpoint);
+        await socket.send(msgpack.encode(request));
+        const [replyBuffer] = await socket.receive();
+        const response = msgpack.decode(replyBuffer);
+        observeLogicalClock(response.logical_clock);
+
+        const referenceTime = Date.parse(response.timestamp);
+        if (Number.isFinite(referenceTime)) {
+            physicalClockOffset = referenceTime - Date.now();
+        }
+        return response;
+    } catch (error) {
+        console.error(`[Servidor JS] Falha na comunicação com a referência (${action}):`, error);
+        return null;
+    } finally {
+        socket.close();
+    }
+}
+
 async function main() {
     const replySocket = new zmq.Reply();
     const publisher = new zmq.Publisher();
-    // Com BROKER_BACKEND definido, o servidor conecta no DEALER do broker;
-    // sem ele, atende os clientes diretamente na porta 5555.
+    const serverName = process.env.SERVER_NAME || process.env.HOSTNAME || `server-javascript-${process.pid}`;
     if (process.env.BROKER_BACKEND) {
         replySocket.connect(process.env.BROKER_BACKEND);
         console.log(`[Servidor JS] Conectado ao broker em ${process.env.BROKER_BACKEND}`);
@@ -58,13 +103,20 @@ async function main() {
     publisher.connect(process.env.PUBSUB_XSUB_ENDPOINT || 'tcp://proxy-pubsub:5557');
     console.log('[Servidor JS] Publisher conectado ao proxy Pub/Sub');
 
+    const registration = await callReference('rank', { name: serverName });
+    if (registration && registration.status === 'success') {
+        console.log(`[Servidor JS] Registrado como ${serverName}, rank ${registration.rank}`);
+    }
+
     for await (const [requestBuffer] of replySocket) {
         const receivedAt = getTimestamp();
         let request;
         let response;
+        clientMessagesReceived += 1;
 
         try {
             request = msgpack.decode(requestBuffer);
+            observeLogicalClock(request && request.logical_clock);
             persistEvent({ type: 'request', receivedAt, request });
 
             if (!request || typeof request !== 'object' ||
@@ -111,8 +163,6 @@ async function main() {
                         response = { status: 'error', message: 'Canal ou mensagem inválidos' };
                         console.log(`[${request.timestamp}][PUB ERRO] Canal ou mensagem inválidos`);
                     } else {
-                        // Com o broker, o canal pode ter sido criado em outro servidor;
-                        // ele passa a ser registrado também neste.
                         if (!loadChannels().has(channel)) {
                             saveChannel(channel, request.timestamp);
                             console.log(`[${request.timestamp}][CHANNEL] Canal registrado a partir de publicação: ${channel}`);
@@ -122,6 +172,8 @@ async function main() {
                             message,
                             timestamp: getTimestamp()
                         };
+                        logicalClock += 1;
+                        publication.logical_clock = logicalClock;
                         if (username) {
                             publication.username = username;
                         }
@@ -140,7 +192,20 @@ async function main() {
             response = { status: 'error', message: 'Falha ao processar a requisição' };
         }
 
+        if (clientMessagesReceived % 10 === 0) {
+            let heartbeat = await callReference('heartbeat', { name: serverName });
+            if (heartbeat && heartbeat.status !== 'success') {
+                console.error(`[Servidor JS] Heartbeat rejeitado: ${heartbeat.message || 'resposta inválida'}`);
+                heartbeat = await callReference('rank', { name: serverName });
+                if (heartbeat && heartbeat.status === 'success') {
+                    console.log(`[Servidor JS] Registro recuperado, rank ${heartbeat.rank}`);
+                }
+            }
+        }
+
+        logicalClock += 1;
         response.timestamp = getTimestamp();
+        response.logical_clock = logicalClock;
         try {
             persistEvent({ type: 'response', timestamp: response.timestamp, response });
             console.log(`[${response.timestamp}][ENVIADO] ${objectToString(response)}`);
