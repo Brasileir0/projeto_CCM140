@@ -11,8 +11,8 @@ O grupo tem 3 integrantes, então são 3 linguagens. Cada linguagem implementa o
 | Integrante | Linguagem |
 |---|---|
 | Vinicius Nobre | C++ |
-| _(nome)_ | JavaScript (Node.js) |
-| _(nome)_ | Python |
+| Gabriel Engle | JavaScript (Node.js) |
+| Breno Queiroga| Python |
 
 Por que essas linguagens:
 - **Python**: tem bibliotecas maduras para ZeroMQ (`pyzmq`) e MessagePack (`msgpack`), e o código fica curto e fácil de ler.
