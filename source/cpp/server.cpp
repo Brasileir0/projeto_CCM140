@@ -418,8 +418,8 @@ long long berkeley_correct_time(const std::string& requester, long long requeste
     }
     clock_reports[requester].difference_ms = 0;
 
-    log_line("[", get_timestamp(), "][BERKELEY] Média de ", clock_reports.size() + 1,
-             " relógios; ajuste do coordenador: ", average, " ms");
+    log_line("[", get_timestamp(), "][RELÓGIO] Coordenador (Berkeley): média de ", clock_reports.size() + 1,
+             " relógios; ajuste do coordenador: ", average, " ms; hora enviada a ", requester);
     return coordinator_time + average;
 }
 
@@ -529,10 +529,17 @@ bool start_election(zmq::context_t& context, zmq::socket_t& pub_socket) {
 
     // Os pedidos são enviados a todos de uma vez e as respostas esperadas por até 1 s.
     std::vector<std::unique_ptr<zmq::socket_t>> sockets;
+    std::vector<std::string> targets;  // nome do servidor de cada socket
     for (const auto& [name, rank] : higher) {
         auto socket = std::make_unique<zmq::socket_t>(context, zmq::socket_type::req);
         socket->set(zmq::sockopt::linger, 0);
-        socket->connect(peer_endpoint(name));
+        try {
+            socket->connect(peer_endpoint(name));
+        } catch (const zmq::error_t& error) {
+            // Servidor que acabou de cair pode nem ter mais o nome na rede; conta como sem resposta.
+            log_error("[", get_timestamp(), "][ELEIÇÃO] Não foi possível conectar a ", name, ": ", error.what());
+            continue;
+        }
         std::map<std::string, std::string> request = {
             {"action", "election"}, {"name", server_name}, {"rank", std::to_string(my_rank)},
             {"timestamp", get_timestamp()}};
@@ -541,6 +548,7 @@ bool start_election(zmq::context_t& context, zmq::socket_t& pub_socket) {
                  " | logical_clock: ", clock);
         send_message(*socket, request, clock);
         sockets.push_back(std::move(socket));
+        targets.push_back(name);
     }
 
     bool someone_answered = false;
@@ -568,7 +576,7 @@ bool start_election(zmq::context_t& context, zmq::socket_t& pub_socket) {
             try {
                 auto fields = decode_message(static_cast<const char*>(reply.data()), reply.size());
                 update_clock(fields);
-                log_line("[", get_timestamp(), "][REP SERVIDOR] de ", higher[i].first, ": ", map_to_string(fields));
+                log_line("[", get_timestamp(), "][REP SERVIDOR] de ", targets[i], ": ", map_to_string(fields));
                 if (fields["status"] == "success") someone_answered = true;
             } catch (const std::exception&) {
             }
@@ -596,7 +604,15 @@ void synchronize_with_coordinator(zmq::context_t& context) {
     zmq::socket_t socket(context, zmq::socket_type::req);
     socket.set(zmq::sockopt::linger, 0);
     socket.set(zmq::sockopt::rcvtimeo, 1000);
-    socket.connect(peer_endpoint(current));
+    try {
+        socket.connect(peer_endpoint(current));
+    } catch (const zmq::error_t& error) {
+        log_line("[", get_timestamp(), "][ELEIÇÃO] Coordenador ", current, " inacessível (", error.what(),
+                 "); pedindo eleição");
+        set_coordinator("");
+        election_requested = true;
+        return;
+    }
 
     const long long sent_at = now_ms();
     std::map<std::string, std::string> request = {
