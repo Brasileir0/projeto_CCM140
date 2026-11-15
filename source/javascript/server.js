@@ -10,8 +10,15 @@ const EVENTS_FILE = path.join(DATA_DIR, 'events.jsonl');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 let logicalClock = 0;
-let physicalClockOffset = 0;
+let physicalClockOffset = Number(process.env.CLOCK_OFFSET_MS) || 0;
 let clientMessagesReceived = 0;
+let coordinatorName = null;
+let serverRank = null;
+let electionInProgress = false;
+let serverName;
+
+const CLOCK_SYNC_INTERVAL = 15;
+const PEER_PORT = Number(process.env.PEER_PORT) || 5560;
 
 function getTimestamp() {
     return new Date(Date.now() + physicalClockOffset).toISOString();
@@ -21,6 +28,11 @@ function observeLogicalClock(value) {
     if (Number.isSafeInteger(value) && value >= 0) {
         logicalClock = Math.max(logicalClock, value);
     }
+}
+
+function tickLogicalClock() {
+    logicalClock += 1;
+    return logicalClock;
 }
 
 function objectToString(values) {
@@ -61,12 +73,11 @@ async function callReference(action, extra = {}) {
 
     const socket = new zmq.Request();
     socket.receiveTimeout = Number(process.env.REFERENCE_TIMEOUT_MS) || 2000;
-    logicalClock += 1;
     const request = {
         action,
         ...extra,
         timestamp: getTimestamp(),
-        logical_clock: logicalClock
+        logical_clock: tickLogicalClock()
     };
     
     try {
@@ -75,11 +86,6 @@ async function callReference(action, extra = {}) {
         const [replyBuffer] = await socket.receive();
         const response = msgpack.decode(replyBuffer);
         observeLogicalClock(response.logical_clock);
-
-        const referenceTime = Date.parse(response.timestamp);
-        if (Number.isFinite(referenceTime)) {
-            physicalClockOffset = referenceTime - Date.now();
-        }
         return response;
     } catch (error) {
         console.error(`[Servidor JS] Falha na comunicação com a referência (${action}):`, error);
@@ -89,10 +95,171 @@ async function callReference(action, extra = {}) {
     }
 }
 
+async function callPeer(peerName, action) {
+    const socket = new zmq.Request();
+    socket.receiveTimeout = Number(process.env.PEER_TIMEOUT_MS) || 1000;
+    socket.sendTimeout = Number(process.env.PEER_TIMEOUT_MS) || 1000;
+    const request = {
+        action,
+        name: serverName,
+        timestamp: getTimestamp(),
+        logical_clock: tickLogicalClock()
+    };
+
+    try {
+        socket.connect(`tcp://${peerName}:${PEER_PORT}`);
+        await socket.send(msgpack.encode(request));
+        const [replyBuffer] = await socket.receive();
+        const response = msgpack.decode(replyBuffer);
+        observeLogicalClock(response.logical_clock);
+        return response;
+    } catch (error) {
+        console.error(`[Servidor JS] Falha na comunicação com ${peerName} (${action}):`, error);
+        return null;
+    } finally {
+        socket.close();
+    }
+}
+
+async function handlePeerRequests(peerSocket) {
+    for await (const [requestBuffer] of peerSocket) {
+        let response;
+        try {
+            const request = msgpack.decode(requestBuffer);
+            observeLogicalClock(request && request.logical_clock);
+
+            if (!request || typeof request !== 'object') {
+                response = { status: 'error', message: 'Requisição inválida' };
+            } else if (request.action === 'election') {
+                response = { status: 'success', message: 'OK' };
+            } else if (request.action === 'clock') {
+                response = { status: 'success', timestamp: getTimestamp() };
+            } else {
+                response = { status: 'error', message: 'Ação desconhecida' };
+            }
+        } catch (error) {
+            console.error('[Servidor JS] Erro ao processar requisição de servidor:', error);
+            response = { status: 'error', message: 'Falha ao processar a requisição' };
+        }
+
+        response.timestamp = response.timestamp || getTimestamp();
+        response.logical_clock = tickLogicalClock();
+        try {
+            await peerSocket.send(msgpack.encode(response));
+        } catch (error) {
+            console.error('[Servidor JS] Erro ao responder requisição de servidor:', error);
+        }
+    }
+}
+
+async function listenForCoordinatorAnnouncements(subscriber) {
+    for await (const frames of subscriber) {
+        if (frames.length < 2) {
+            continue;
+        }
+
+        try {
+            const announcement = msgpack.decode(frames[1]);
+            observeLogicalClock(announcement && announcement.logical_clock);
+            const announcedName = typeof announcement === 'string'
+                ? announcement
+                : announcement && (announcement.coordinator || announcement.name);
+            if (typeof announcedName === 'string' && announcedName.trim()) {
+                coordinatorName = announcedName.trim();
+                console.log(`[Servidor JS] Coordenador anunciado: ${coordinatorName}`);
+            }
+        } catch (error) {
+            console.error('[Servidor JS] Anúncio de coordenador inválido:', error);
+        }
+    }
+}
+
+async function announceCoordinator(publisher) {
+    coordinatorName = serverName;
+    const announcement = {
+        action: 'coordinator',
+        coordinator: serverName,
+        timestamp: getTimestamp(),
+        logical_clock: tickLogicalClock()
+    };
+    await publisher.send([Buffer.from('servers'), msgpack.encode(announcement)]);
+    console.log(`[Servidor JS] Eleito coordenador: ${serverName}`);
+}
+
+async function electCoordinator(publisher) {
+    if (electionInProgress) {
+        return;
+    }
+    electionInProgress = true;
+
+    try {
+        const directory = await callReference('list');
+        if (!directory || directory.status !== 'success' || !Array.isArray(directory.servers)) {
+            console.error('[Servidor JS] Não foi possível consultar os servidores para a eleição.');
+            return;
+        }
+
+        const available = directory.servers.filter((server) =>
+            server && typeof server.name === 'string' && Number.isSafeInteger(server.rank)
+        );
+        const ownEntry = available.find((server) => server.name === serverName);
+        if (ownEntry) {
+            serverRank = ownEntry.rank;
+        }
+
+        const candidates = [{ name: serverName, rank: serverRank || 0 }];
+        const peers = available.filter((server) => server.name !== serverName);
+        const peerReplies = await Promise.all(peers.map(async (server) => {
+            const response = await callPeer(server.name, 'election');
+            return response && response.status === 'success' ? server : null;
+        }));
+        candidates.push(...peerReplies.filter(Boolean));
+        candidates.sort((left, right) => left.rank - right.rank);
+
+        const elected = candidates[candidates.length - 1];
+        coordinatorName = elected.name;
+        if (elected.name === serverName) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            await announceCoordinator(publisher);
+        } else {
+            console.log(`[Servidor JS] Coordenador disponível: ${coordinatorName}`);
+        }
+    } finally {
+        electionInProgress = false;
+    }
+}
+
+async function synchronizeClock(publisher) {
+    if (!coordinatorName) {
+        await electCoordinator(publisher);
+    }
+    if (!coordinatorName || coordinatorName === serverName) {
+        return;
+    }
+
+    const sentAt = Date.now() + physicalClockOffset;
+    const response = await callPeer(coordinatorName, 'clock');
+    const receivedAt = Date.now() + physicalClockOffset;
+    const coordinatorTime = response && Date.parse(response.timestamp);
+    if (!response || response.status !== 'success' || !Number.isFinite(coordinatorTime)) {
+        console.error(`[Servidor JS] Coordenador indisponível: ${coordinatorName}`);
+        coordinatorName = null;
+        await electCoordinator(publisher);
+        return;
+    }
+
+    const estimatedCoordinatorTime = coordinatorTime + (receivedAt - sentAt) / 2;
+    const adjustment = estimatedCoordinatorTime - receivedAt;
+    physicalClockOffset += adjustment;
+    console.log(`[Servidor JS] Relógio sincronizado com ${coordinatorName}: ajuste ${adjustment.toFixed(1)} ms`);
+}
+
 async function main() {
     const replySocket = new zmq.Reply();
+    const peerSocket = new zmq.Reply();
     const publisher = new zmq.Publisher();
-    const serverName = process.env.SERVER_NAME || process.env.HOSTNAME || `server-javascript-${process.pid}`;
+    const subscriber = new zmq.Subscriber();
+    serverName = process.env.SERVER_NAME || process.env.HOSTNAME || `server-javascript-${process.pid}`;
     if (process.env.BROKER_BACKEND) {
         replySocket.connect(process.env.BROKER_BACKEND);
         console.log(`[Servidor JS] Conectado ao broker em ${process.env.BROKER_BACKEND}`);
@@ -101,11 +268,26 @@ async function main() {
         console.log('[Servidor JS] Req-Rep ativo na porta 5555.');
     }
     publisher.connect(process.env.PUBSUB_XSUB_ENDPOINT || 'tcp://proxy-pubsub:5557');
+    subscriber.connect(process.env.PUBSUB_XPUB_ENDPOINT || 'tcp://proxy-pubsub:5558');
+    subscriber.subscribe('servers');
     console.log('[Servidor JS] Publisher conectado ao proxy Pub/Sub');
+    const peerEndpoint = process.env.PEER_BIND_ENDPOINT || `tcp://*:${PEER_PORT}`;
+    await peerSocket.bind(peerEndpoint);
+    console.log(`[Servidor JS] Comunicação entre servidores ativa em ${peerEndpoint}`);
+    handlePeerRequests(peerSocket).catch((error) => {
+        console.error('[Servidor JS] Falha no serviço entre servidores:', error);
+        process.exitCode = 1;
+    });
+    listenForCoordinatorAnnouncements(subscriber).catch((error) => {
+        console.error('[Servidor JS] Falha ao receber anúncios de coordenador:', error);
+        process.exitCode = 1;
+    });
 
     const registration = await callReference('rank', { name: serverName });
     if (registration && registration.status === 'success') {
+        serverRank = registration.rank;
         console.log(`[Servidor JS] Registrado como ${serverName}, rank ${registration.rank}`);
+        await electCoordinator(publisher);
     }
 
     for await (const [requestBuffer] of replySocket) {
@@ -198,12 +380,16 @@ async function main() {
                 console.error(`[Servidor JS] Heartbeat rejeitado: ${heartbeat.message || 'resposta inválida'}`);
                 heartbeat = await callReference('rank', { name: serverName });
                 if (heartbeat && heartbeat.status === 'success') {
+                    serverRank = heartbeat.rank;
                     console.log(`[Servidor JS] Registro recuperado, rank ${heartbeat.rank}`);
                 }
             }
         }
+        if (clientMessagesReceived % CLOCK_SYNC_INTERVAL === 0) {
+            await synchronizeClock(publisher);
+        }
 
-        logicalClock += 1;
+        tickLogicalClock();
         response.timestamp = getTimestamp();
         response.logical_clock = logicalClock;
         try {
