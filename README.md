@@ -4,11 +4,11 @@ Projeto da disciplina de Sistemas Distribuídos. É uma versão simplificada de 
 
 Toda a comunicação usa **ZeroMQ** e todo o sistema roda em **containers Docker** orquestrados pelo **Docker Compose**. Nenhum passo depende de interação humana: os usuários são bots.
 
-Desde a parte 3, todas as mensagens levam um **relógio lógico**, e um **serviço de referência** controla quais servidores estão ativos (rank e heartbeat) e fornece a hora correta para sincronizar o relógio físico dos servidores.
+Desde a parte 3, todas as mensagens levam um **relógio lógico**, e um **serviço de referência** controla quais servidores estão ativos (rank e heartbeat). Desde a parte 4, os servidores **elegem um coordenador** entre si, e é ele que fornece a hora correta para sincronizar o relógio físico dos outros servidores (algoritmo de Berkeley).
 
 ## Integrantes e linguagens
 
-O grupo tem 3 integrantes, então são 3 linguagens. Cada linguagem implementa o cliente, o servidor, o broker e o proxy, e todos conversam entre si. O serviço de referência foi implementado em C++ e em JavaScript.
+O grupo tem 3 integrantes, então são 3 linguagens. Cada linguagem implementa o cliente, o servidor, o broker, o proxy e o serviço de referência, e todos conversam entre si.
 
 | Integrante | Linguagem |
 |---|---|
@@ -64,9 +64,11 @@ flowchart LR
 
     Clientes -- REQ --> B
     B -- DEALER --> Servidores
-    Servidores -- PUB --> P
+    Servidores -- PUB (canais e tópico servers) --> P
     P -- SUB --> Clientes
+    P -- SUB: tópico servers --> Servidores
     Servidores -- REQ: rank / heartbeat / list --> R
+    Servidores -- REQ: election / clock (porta 5560) --> Servidores
 ```
 
 O compose sobe 15 containers:
@@ -75,13 +77,13 @@ O compose sobe 15 containers:
 |---|---|---|
 | `broker` | C++ | Proxy Req-Rep. Os clientes se conectam no ROUTER (5555) e os servidores no DEALER (5556). O DEALER distribui as requisições entre os servidores em round-robin. |
 | `proxy-pubsub` | JavaScript | Proxy Pub/Sub. Os servidores publicam no XSUB (5557) e os clientes assinam no XPUB (5558). |
-| `referencia` | C++ | Serviço de referência (porta 5559). Conversa só com os servidores: dá o rank, mantém a lista de servidores ativos por heartbeat e informa a hora correta. |
-| `server-{python,javascript,cpp}-{1,2}` | as 3 linguagens | 2 servidores por linguagem. Cada um tem o seu próprio volume de dados. |
+| `referencia` | C++ | Serviço de referência (porta 5559). Conversa só com os servidores: dá o rank e mantém a lista de servidores ativos por heartbeat. |
+| `server-{python,javascript,cpp}-{1,2}` | as 3 linguagens | 2 servidores por linguagem. Cada um tem o seu próprio volume de dados e atende os outros servidores (eleição e relógio) na porta 5560. |
 | `client-{python,javascript,cpp}-{1,2}` | as 3 linguagens | 2 bots por linguagem. |
 
-O broker e o proxy foram implementados nas três linguagens (`broker.py/js/cpp`, `proxy_pubsub.py/js/cpp`), e a referência em C++ e JavaScript (`referencia.cpp`, `reference.js`). Como só uma instância de cada é necessária, o compose usa o broker em C++, o proxy em JavaScript e a referência em C++. As outras versões seguem o mesmo protocolo e podem substituí-las trocando o `build`/`command` do serviço.
+O broker, o proxy e a referência foram implementados nas três linguagens (`broker.py/js/cpp`, `proxy_pubsub.py/js/cpp`, `reference.py`/`reference.js`/`referencia.cpp`). Como só uma instância de cada é necessária, o compose usa o broker em C++, o proxy em JavaScript e a referência em C++. As outras versões seguem o mesmo protocolo e podem substituí-las trocando o `build`/`command` do serviço.
 
-Cada servidor recebe no compose as variáveis `SERVER_NAME` (o nome usado na referência, por exemplo `server-cpp-1`) e `REFERENCE_ENDPOINT` (`tcp://referencia:5559`).
+Cada servidor recebe no compose as variáveis `SERVER_NAME` (o nome usado na referência e na eleição, por exemplo `server-cpp-1`, que também é o nome do container na rede), `REFERENCE_ENDPOINT` (`tcp://referencia:5559`) e `PEER_PORT`/`PEER_BIND_ENDPOINT` (a porta 5560, usada na comunicação entre servidores).
 
 Como o broker distribui as requisições em round-robin, as requisições consecutivas de um mesmo bot podem ser atendidas por servidores de linguagens diferentes. Isso garante que todo servidor atenda clientes de todas as linguagens.
 
@@ -128,7 +130,7 @@ Ao iniciar, o bot faz login (e repete o login em caso de erro). Depois fica em l
 
 Cliente e servidor imprimem na tela todas as mensagens enviadas e recebidas, com o conteúdo completo:
 - **cliente:** `[REQ]` e `[REP]` para as requisições, e um bloco `NOVA MENSAGEM` para cada publicação recebida, que inclui o relógio lógico da publicação e o relógio local depois de recebê-la;
-- **servidor:** `[RECEBIDO]` e `[ENVIADO]` para cada requisição, `[PUB]` para cada publicação e as mensagens trocadas com a referência (`[REQ REFERÊNCIA]`/`[REP REFERÊNCIA]` no C++, `[REF-REQ]`/`[REF-REP]` no Python).
+- **servidor:** `[RECEBIDO]` e `[ENVIADO]` para cada requisição, `[PUB]` para cada publicação, as mensagens trocadas com a referência (`[REQ REFERÊNCIA]`/`[REP REFERÊNCIA]` no C++, `[REF-REQ]`/`[REF-REP]` no Python) e as trocadas com outros servidores (`[REQ SERVIDOR]`/`[REP SERVIDOR]`/`[RECEBIDO SERVIDOR]`/`[ENVIADO SERVIDOR]` no C++, `[PEER-...]` no Python), além de `[ELEIÇÃO]`, `[COORDENADOR]` e `[RELÓGIO]`.
 
 ## Relógios e heartbeat (parte 3)
 
@@ -150,10 +152,10 @@ O serviço `referencia` (porta 5559, `REQ`/`REP`) só recebe mensagens dos servi
 | `action` | Enviado pelo servidor | Resposta |
 |---|---|---|
 | `rank` | `name` | `status: success` e `rank`. O mesmo nome recebe sempre o mesmo rank, então não há repetição. |
-| `heartbeat` | `name` | `status: success`, `message: OK` e `rank`. Se o servidor nunca pediu rank, responde `status: error` com `Servidor não registrado`. |
+| `heartbeat` | `name` | `status: success` e `message: OK`. Se o servidor nunca pediu rank, responde `status: error` com `Servidor não registrado`. |
 | `list` | `name` | `status: success` e `servers`, a lista de `{ name, rank }` dos servidores disponíveis, ordenada pelo rank. |
 
-Toda resposta da referência leva também o `timestamp` com a **hora correta**, no formato ISO 8601 UTC com milissegundos (por exemplo `2026-11-15T19:07:34.856Z`), e o `logical_clock`.
+Toda resposta da referência leva também o `timestamp` de envio e o `logical_clock`, como qualquer mensagem. Na parte 3 esse `timestamp` era a hora correta usada pelos servidores; **desde a parte 4 a referência não fornece mais a hora** (o heartbeat responde só `OK`), e a hora correta vem do coordenador eleito (ver [Eleição e sincronização](#eleição-e-sincronização-parte-4)).
 
 **Remoção de servidores:** a referência guarda o horário do último rank/heartbeat de cada servidor. Se um servidor passa mais de 30 segundos sem mandar heartbeat (configurável com `HEARTBEAT_TIMEOUT_MS`), ele é removido da lista de disponíveis e aparece `[REMOVIDO]` no log. Quando ele volta a se comunicar, retorna à lista com o mesmo rank.
 
@@ -164,14 +166,9 @@ Toda resposta da referência leva também o `timestamp` com a **hora correta**, 
 - **Se a referência responder `Servidor não registrado`** (por exemplo, porque ela reiniciou), o servidor pede o rank de novo.
 - **Se a referência não responder** dentro de 2 segundos, o servidor registra o erro e continua atendendo os clientes, em vez de travar.
 
-### Sincronização do relógio físico
+### Sincronização do relógio físico (parte 3)
 
-Cada servidor guarda uma diferença (em ms) entre o seu relógio e o relógio do sistema. Todos os timestamps que o servidor gera usam o relógio já corrigido. A correção usa a hora da resposta da referência:
-
-- **C++ e Python** usam o algoritmo de Cristian: a hora correta estimada é a hora da referência mais metade do tempo de ida e volta da mensagem. O ajuste é feito a cada heartbeat (no Python, também na resposta do rank) e aparece no log como `[RELÓGIO] Ajuste de X ms`.
-- **JavaScript** usa a hora da referência diretamente, a cada resposta recebida dela.
-
-Como todos os containers usam o relógio da mesma máquina, os ajustes normalmente ficam entre −2 e +2 ms. Para ver a sincronização corrigindo um relógio atrasado, os servidores C++ e Python aceitam a variável `CLOCK_OFFSET_MS`: com `CLOCK_OFFSET_MS: "4000"` no `environment` de um servidor, ele começa 4 segundos adiantado e o primeiro heartbeat corrige essa diferença.
+Na parte 3, cada servidor acertava o relógio físico com a hora que a referência mandava na resposta do heartbeat. Desde a parte 4 isso foi substituído pela sincronização com o coordenador, descrita na seção seguinte.
 
 ### Como verificar
 
@@ -188,6 +185,66 @@ docker compose logs referencia | grep REMOVIDO
 # ao religar, o servidor recebe o mesmo rank
 docker compose start server-cpp-2
 docker compose logs server-cpp-2 | grep RANK
+```
+
+## Eleição e sincronização (parte 4)
+
+### Comunicação entre servidores
+
+Cada servidor atende os outros servidores num socket `REP` próprio na **porta 5560** (`tcp://<nome do servidor>:5560`). Os nomes e ranks dos outros servidores vêm da lista da referência (`list`). Há duas ações:
+
+| `action` | Enviado por | Resposta |
+|---|---|---|
+| `election` | um servidor que quer eleger um coordenador (com `name` e, no C++ e no Python, `rank`) | `status: success`, `message: OK` |
+| `clock` | um servidor que quer acertar o relógio (com `name` e o `timestamp` de envio) | `status: success`, `message: Hora correta` e o `timestamp` com a hora correta, em ISO 8601 UTC com milissegundos |
+
+No servidor C++, essa porta é atendida por uma thread separada, para que ele consiga responder a pedidos de eleição mesmo enquanto espera a resposta de outro servidor.
+
+### Eleição (algoritmo do valentão)
+
+Vence a eleição o servidor disponível de **maior rank**:
+
+1. o servidor que começa a eleição manda `election` para todos os servidores de rank maior que o seu e espera as respostas por até 1 segundo;
+2. se nenhum responder, ele se declara coordenador e publica no tópico **`servers`** do Pub/Sub uma mensagem com `coordinator` (o seu nome) e `rank`;
+3. se algum responder `OK`, ele espera o anúncio do novo coordenador (no C++, por até 5 segundos; se não chegar, repete a eleição);
+4. quem recebe um pedido de eleição responde `OK` e começa a sua própria eleição.
+
+Todos os servidores assinam o tópico `servers` e guardam numa variável o nome do coordenador anunciado (`[COORDENADOR] Novo coordenador: ...`). Nos servidores C++ e Python, quem recebe o anúncio de um coordenador com rank menor que o seu começa uma eleição para assumir.
+
+Uma eleição começa:
+- quando o servidor inicia, depois de pedir o rank;
+- quando o coordenador não responde ao pedido de relógio;
+- quando o coordenador some da lista de servidores disponíveis da referência.
+
+### Sincronização do relógio (algoritmo de Berkeley)
+
+**A cada 15 mensagens de clientes recebidas**, cada servidor manda `clock` ao coordenador:
+
+1. o servidor manda a sua hora atual no `timestamp` do pedido;
+2. o coordenador calcula a hora correta e responde no `timestamp`;
+3. o servidor estima a hora correta como `hora do coordenador + metade do tempo de ida e volta` e ajusta o seu relógio pela diferença (`[RELÓGIO] Ajuste de X ms pelo coordenador ...`).
+
+Quando o coordenador é um servidor **C++**, a hora correta é calculada pelo algoritmo de Berkeley: o coordenador guarda a diferença entre o relógio de cada servidor que pediu a hora (no último minuto) e o seu, calcula a média dessas diferenças incluindo a sua (que é 0), ajusta o próprio relógio por essa média e responde a hora média (`[RELÓGIO] Coordenador (Berkeley): média de N relógios ...`). Os coordenadores Python e JavaScript respondem a própria hora.
+
+O próprio coordenador não pede a hora a ninguém. Cada servidor guarda a diferença entre o seu relógio e o do sistema, e todos os timestamps que ele gera usam o relógio já corrigido.
+
+Como todos os containers usam o relógio da mesma máquina, os ajustes normalmente ficam entre −2 e +2 ms. Para ver a sincronização corrigindo um relógio adiantado, os servidores C++ e Python aceitam a variável `CLOCK_OFFSET_MS`: com `CLOCK_OFFSET_MS: "4000"` no `environment` de um servidor, ele começa 4 segundos adiantado e a primeira sincronização com o coordenador corrige essa diferença.
+
+### Como verificar
+
+Com os containers rodando, num segundo terminal (em `source/`):
+
+```bash
+# eleição e coordenador atual
+docker compose logs | grep -E "ELEIÇÃO|COORDENADOR|Eleito|Coordenador"
+
+# sincronização com o coordenador (depois de pelo menos 1 minuto rodando)
+docker compose logs | grep -E "RELÓGIO|sincronizado"
+
+# troca de coordenador: pare o coordenador atual (por exemplo server-cpp-2) e,
+# depois de uns 30 segundos, veja a nova eleição
+docker compose stop server-cpp-2
+docker compose logs --since 60s | grep -E "ELEIÇÃO|COORDENADOR|Eleito|indisponível|não respondeu"
 ```
 
 ## Persistência
@@ -208,7 +265,7 @@ Os formatos de armazenamento são livres (a restrição de não usar JSON vale s
 source/
 ├── docker-compose.yml
 ├── protocol/protocol.md   # especificação das mensagens
-├── python/                # client.py, server.py, broker.py, proxy_pubsub.py, Dockerfile
+├── python/                # client.py, server.py, broker.py, proxy_pubsub.py, reference.py, Dockerfile
 ├── javascript/            # client.js, server.js, broker.js, proxy_pubsub.js, reference.js, Dockerfile
 └── cpp/                   # client.cpp, server.cpp, broker.cpp, proxy_pubsub.cpp, referencia.cpp, CMakeLists.txt, Dockerfile
 _etapas-do-projeto/        # enunciado e partes do projeto
