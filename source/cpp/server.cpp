@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <iomanip>
@@ -78,6 +79,48 @@ std::string get_timestamp() {
     std::stringstream ss;
     ss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S");
     return ss.str();
+}
+
+// Hora em ms -> "AAAA-MM-DDTHH:MM:SS.mmmZ" (UTC). É o formato que Python e JS usam
+// para trocar a hora correta com o coordenador.
+std::string iso_timestamp(long long milliseconds) {
+    std::time_t in_time_t = static_cast<std::time_t>(milliseconds / 1000);
+    std::tm utc_time{};
+    gmtime_r(&in_time_t, &utc_time);
+    std::stringstream ss;
+    ss << std::put_time(&utc_time, "%Y-%m-%dT%H:%M:%S") << "." << std::setw(3) << std::setfill('0')
+       << (milliseconds % 1000) << "Z";
+    return ss.str();
+}
+
+// "AAAA-MM-DDTHH:MM:SS(.fff)" (com T ou espaço; considerado UTC) -> ms desde a época.
+bool parse_timestamp_ms(const std::string& timestamp, long long& milliseconds) {
+    std::tm time{};
+    double seconds = 0;
+    if (std::sscanf(timestamp.c_str(), "%d-%d-%d%*c%d:%d:%lf", &time.tm_year, &time.tm_mon, &time.tm_mday,
+                    &time.tm_hour, &time.tm_min, &seconds) != 6) {
+        return false;
+    }
+    time.tm_year -= 1900;
+    time.tm_mon -= 1;
+    time.tm_sec = 0;
+    milliseconds = static_cast<long long>(timegm(&time)) * 1000 + static_cast<long long>(seconds * 1000);
+    return true;
+}
+
+// Hora informada numa mensagem de relógio: o campo "time" (ms) se existir;
+// senão, o "timestamp" (como mandam os servidores Python e JS).
+bool message_time_ms(const std::map<std::string, std::string>& fields, long long& milliseconds) {
+    const auto time = fields.find("time");
+    if (time != fields.end() && !time->second.empty()) {
+        try {
+            milliseconds = std::stoll(time->second);
+            return true;
+        } catch (const std::exception&) {
+        }
+    }
+    const auto timestamp = fields.find("timestamp");
+    return timestamp != fields.end() && parse_timestamp_ms(timestamp->second, milliseconds);
 }
 
 std::string get_coordinator() {
@@ -415,9 +458,17 @@ void peer_loop(zmq::context_t& context) {
                     reply["message"] = "Não sou o coordenador";
                     reply["coordinator"] = current;
                 } else {
-                    const long long correct_time = berkeley_correct_time(fields["name"], std::stoll(fields["time"]));
+                    // Sem hora válida no pedido, o relógio de quem pediu entra na média como igual ao do coordenador.
+                    long long requester_time = 0;
+                    if (!message_time_ms(fields, requester_time)) {
+                        requester_time = now_ms();
+                    }
+                    const long long correct_time = berkeley_correct_time(fields["name"], requester_time);
                     reply["status"] = "success";
+                    reply["message"] = "Hora correta";
                     reply["time"] = std::to_string(correct_time);
+                    // Python e JS leem a hora correta do timestamp, em ISO com milissegundos.
+                    reply["timestamp"] = iso_timestamp(correct_time);
                     reply["coordinator"] = server_name;
                 }
             } else {
@@ -430,9 +481,11 @@ void peer_loop(zmq::context_t& context) {
             log_error("[", get_timestamp(), "][ERRO] Pedido de servidor inválido: ", error.what());
         }
 
-        reply["timestamp"] = get_timestamp();
+        if (reply["timestamp"].empty()) {
+            reply["timestamp"] = get_timestamp();
+        }
         const long long clock = tick();
-        log_line("[", reply["timestamp"], "][ENVIADO SERVIDOR] ", map_to_string(reply), " | logical_clock: ", clock);
+        log_line("[", get_timestamp(), "][ENVIADO SERVIDOR] ", map_to_string(reply), " | logical_clock: ", clock);
         send_message(socket, reply, clock);
     }
 }
@@ -547,8 +600,8 @@ void synchronize_with_coordinator(zmq::context_t& context) {
 
     const long long sent_at = now_ms();
     std::map<std::string, std::string> request = {
-        {"action", "clock"}, {"name", server_name}, {"time", std::to_string(sent_at)},
-        {"timestamp", get_timestamp()}};
+        {"action", "clock"}, {"name", server_name}, {"rank", std::to_string(my_rank)},
+        {"time", std::to_string(sent_at)}, {"timestamp", iso_timestamp(sent_at)}};
     const long long clock = tick();
     log_line("[", request["timestamp"], "][REQ SERVIDOR] para ", current, ": ", map_to_string(request),
              " | logical_clock: ", clock);
@@ -572,7 +625,12 @@ void synchronize_with_coordinator(zmq::context_t& context) {
             election_requested = true;
             return;
         }
-        const long long estimated_time = std::stoll(fields["time"]) + (received_at - sent_at) / 2;
+        long long coordinator_time = 0;
+        if (!message_time_ms(fields, coordinator_time)) {
+            log_error("[", get_timestamp(), "][RELÓGIO ERRO] Resposta do coordenador sem hora");
+            return;
+        }
+        const long long estimated_time = coordinator_time + (received_at - sent_at) / 2;
         const long long adjustment = estimated_time - received_at;
         clock_offset_ms += adjustment;
         log_line("[", get_timestamp(), "][RELÓGIO] Ajuste de ", adjustment, " ms pelo coordenador ", current,
