@@ -1,6 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import os
+import time
 import msgpack
 import zmq
 import json
@@ -11,7 +12,7 @@ CHANNELS_FILE = DATA_DIR / "channels.txt"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
 SERVER_NAME = os.environ.get("SERVER_NAME") or os.environ.get("HOST_NAME") or f"server-python-{os.getpid()}"
 REFERENCE_ENDPOINT = os.environ.get("REFERENCE_ENDPOINT", "")
-REFERENCE_TIMEOUT_MS = int(os.environ.get("REFERENCE_TIMEOUT_MS"), "2000")
+REFERENCE_TIMEOUT_MS = int(os.environ.get("REFERENCE_TIMEOUT_MS", "2000"))
 HEARTBEAT_INTERVAL = 10
 logical_clock = 0
 clock_offset = timedelta(milliseconds=float(os.environ.get("CLOCK_OFFSET_MS", "0")))
@@ -20,7 +21,7 @@ def get_now() -> datetime:
     return datetime.now(timezone.utc) + clock_offset
 
 def get_timestamp() -> str:
-    return datetime.now().astimezone().isoformat()
+    return get_now().astimezone().isoformat()
 
 def tick() -> int:
     global logical_clock
@@ -29,7 +30,7 @@ def tick() -> int:
 
 def observe_logical_clock(value:object) -> None:
     global logical_clock
-    if isistance(value, int) and not isinstance(value, bool) and value >= 0:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         logical_clock = max(logical_clock, value)
 
 def dict_to_string(values: dict) -> str:
@@ -60,12 +61,12 @@ def synchronize_clock(reference_timestamp: object, sent_at: datetime, received_a
     adjusment = estimated_now - received_at
     clock_offset += adjusment
     print(
-        f"[{get_timestamp()}][RELÓGIO] Ajuste de {adjusment.total_seconds() * 1000:+.1f} ms"
-        f"(diferença atual para o sistema: {clock_offset.total_seconds() * 1000:+.1f})", flush=True
+        f"[{get_timestamp()}][RELÓGIO] Ajuste de {adjusment.total_seconds() * 1000:+.1f} ms "
+        f"(diferença atual para o sistema: {clock_offset.total_seconds() * 1000:+.1f} ms)", flush=True
         )
 
 def call_reference(context: zmq.Context, action: str) -> dict | None:
-    if not REFENCE_ENDPOINT:
+    if not REFERENCE_ENDPOINT:
         return None
 
     socket = context.socket(zmq.REQ)
@@ -74,7 +75,7 @@ def call_reference(context: zmq.Context, action: str) -> dict | None:
     socket.setsockopt(zmq.SNDTIMEO, REFERENCE_TIMEOUT_MS)
 
     try:
-        socket.connect(REFENCE_ENDPOINT)
+        socket.connect(REFERENCE_ENDPOINT)
         request = {"action": action, "name": SERVER_NAME}
         request["logical_clock"] = tick()
         request["timestamp"] = get_timestamp()
@@ -86,7 +87,7 @@ def call_reference(context: zmq.Context, action: str) -> dict | None:
         received_at = get_now()
 
         response = msgpack.unpackb(raw_response, raw=False)
-        if not isistance(response, dict):
+        if not isinstance(response, dict):
             raise ValueError("resposta inválida da referência")
         observe_logical_clock(response.get("logical_clock"))
         print(f"[{get_timestamp()}][REF-REP] {dict_to_string(response)}", flush=True)
@@ -253,6 +254,10 @@ def main() -> None:
     publisher.connect(os.environ.get("PUBSUB_XSUB_ENDPOINT", "tcp://proxy-pubsub:5557"))
     print("[Servidor Python] Publisher conectado ao proxy Pub/Sub", flush=True)
 
+    if REFERENCE_ENDPOINT:
+        request_rank(context)
+    client_messages = 0
+
     try:
         while True:
             raw_request = socket.recv()
@@ -270,8 +275,10 @@ def main() -> None:
             if not isinstance(request, dict):
                 response = {"status": "error", "message": "Requisição inválida"}
             else:
+                observe_logical_clock(request.get("logical_clock"))
                 print(f"[{received_at}][RECEBIDO] {dict_to_string(request)}", flush=True)
                 response = handle_request(request, publisher)
+            response["logical_clock"] = tick()
             response["timestamp"] = get_timestamp()
             persist_event({
                 "type": "response",
@@ -281,6 +288,8 @@ def main() -> None:
             print(f"[{response['timestamp']}][ENVIADO] {dict_to_string(response)}", flush=True)
             socket.send(msgpack.packb(response, use_bin_type=True))
 
+            # A cada 10 mensagens de clientes, avisa a referência que está ativo.
+            client_messages += 1
             if REFERENCE_ENDPOINT and client_messages % HEARTBEAT_INTERVAL == 0:
                 send_heartbeat(context)
 

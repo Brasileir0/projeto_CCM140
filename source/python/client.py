@@ -27,7 +27,7 @@ def tick() -> int:
 def observe_logical_clock(value: object) -> int:
     global logical_clock
     with clock_lock:
-        if isistance(value, int) and not isistance(value, bool) and value >= 0:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             logical_clock = max(logical_clock, value)
         return logical_clock
 
@@ -55,12 +55,14 @@ def dict_to_string(values: dict) -> str:
 
 
 def send_request(socket: zmq.Socket, request: dict[str, str]) -> dict[str, str]:
+    request["logical_clock"] = tick()
     request["timestamp"] = get_timestamp()
     log(f"[{request['timestamp']}][REQ] {dict_to_string(request)}")
     socket.send(msgpack.packb(request, use_bin_type=True))
     response = msgpack.unpackb(socket.recv(), raw=False)
     if not isinstance(response, dict):
         raise ValueError("Resposta inválida do servidor.")
+    observe_logical_clock(response.get("logical_clock"))
     log(
         f"[{format_timestamp(response.get('timestamp', get_timestamp()))}]"
         f"[REP] {dict_to_string(response)}"
@@ -106,6 +108,7 @@ def receive_messages(endpoint: str) -> None:
                 log("[SUB][ERRO] Conteúdo de publicação inválido")
                 continue
 
+            local_clock = observe_logical_clock(publication.get("logical_clock"))
             author = publication.get("username")
             log(
                 "\n---------- NOVA MENSAGEM ---------\n"
@@ -114,6 +117,7 @@ def receive_messages(endpoint: str) -> None:
                 + f"Mensagem: {publication.get('message', '')}\n"
                 f"Enviada em: {format_timestamp(publication.get('timestamp'))}\n"
                 f"Recebida em: {get_timestamp()}\n"
+                f"Relógio lógico: {publication.get('logical_clock', 'indisponível')} (local após receber: {local_clock})\n"
                 "------------------------------------\n"
             )
     finally:
