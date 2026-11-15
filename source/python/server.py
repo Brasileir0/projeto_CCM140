@@ -9,9 +9,28 @@ DATA_DIR = Path("data")
 USERS_FILE = DATA_DIR / "users.txt"
 CHANNELS_FILE = DATA_DIR / "channels.txt"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
+SERVER_NAME = os.environ.get("SERVER_NAME") or os.environ.get("HOST_NAME") or f"server-python-{os.getpid()}"
+REFERENCE_ENDPOINT = os.environ.get("REFERENCE_ENDPOINT", "")
+REFERENCE_TIMEOUT_MS = int(os.environ.get("REFERENCE_TIMEOUT_MS"), "2000")
+HEARTBEAT_INTERVAL = 10
+logical_clock = 0
+clock_offset = timedelta(milliseconds=float(os.environ.get("CLOCK_OFFSET_MS", "0")))
+
+def get_now() -> datetime:
+    return datetime.now(timezone.utc) + clock_offset
 
 def get_timestamp() -> str:
     return datetime.now().astimezone().isoformat()
+
+def tick() -> int:
+    global logical_clock
+    logical_clock += 1
+    return logical_clock
+
+def observe_logical_clock(value:object) -> None:
+    global logical_clock
+    if isistance(value, int) and not isinstance(value, bool) and value >= 0:
+        logical_clock = max(logical_clock, value)
 
 def dict_to_string(values: dict) -> str:
     return "{ " + " | ".join(f"{key}: {values[key]}" for key in sorted(values)) + " }"
@@ -24,6 +43,90 @@ def load_channels() -> set[str]:
         for channel in CHANNELS_FILE.read_text(encoding="utf-8").splitlines()
         if channel.strip()
     }
+
+def synchronize_clock(reference_timestamp: object, sent_at: datetime, received_at: datetime) -> None:
+    global clock_offset
+    if not isinstance(reference_timestamp, str):
+        return
+    try:
+        reference_time = datetime.fromisoformat(reference_timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        print(f"[{get_timestamp()}][RELÓGIO] Hora inválida da referência: {reference_timestamp}", flush=True)
+        return
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+
+    estimated_now = reference_time + (received_at - sent_at) / 2
+    adjusment = estimated_now - received_at
+    clock_offset += adjusment
+    print(
+        f"[{get_timestamp()}][RELÓGIO] Ajuste de {adjusment.total_seconds() * 1000:+.1f} ms"
+        f"(diferença atual para o sistema: {clock_offset.total_seconds() * 1000:+.1f})", flush=True
+        )
+
+def call_reference(context: zmq.Context, action: str) -> dict | None:
+    if not REFENCE_ENDPOINT:
+        return None
+
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.setsockopt(zmq.RCVTIMEO, REFERENCE_TIMEOUT_MS)
+    socket.setsockopt(zmq.SNDTIMEO, REFERENCE_TIMEOUT_MS)
+
+    try:
+        socket.connect(REFENCE_ENDPOINT)
+        request = {"action": action, "name": SERVER_NAME}
+        request["logical_clock"] = tick()
+        request["timestamp"] = get_timestamp()
+        print(f"[{request['timestamp']}][REF-REQ] {dict_to_string(request)}", flush=True)
+
+        sent_at = get_now()
+        socket.send(msgpack.packb(request, use_bin_type=True))
+        raw_response = socket.recv()
+        received_at = get_now()
+
+        response = msgpack.unpackb(raw_response, raw=False)
+        if not isistance(response, dict):
+            raise ValueError("resposta inválida da referência")
+        observe_logical_clock(response.get("logical_clock"))
+        print(f"[{get_timestamp()}][REF-REP] {dict_to_string(response)}", flush=True)
+
+        if response.get("status") == "success":
+            synchronize_clock(response.get("timestamp"), sent_at, received_at)
+        return response
+    except zmq.Again:
+        print(f"[{get_timestamp()}][REF-ERRO] Referência não respondeu ({action})", flush=True)
+        return None
+
+    except Exception as error:
+        print(f"[{get_timestamp()}][REF-ERRO] Falha na comunicação com a referência ({action}): {error}", flush=True)
+        return None
+
+    finally:
+        socket.close()
+
+def request_rank(context: zmq.Context, attempts: int=10) -> int | None:
+    for attempt in range(attempts):
+        response = call_reference(context, "rank")
+        if response and response.get("status") == "success":
+            rank = response.get("rank")
+            print(f"[{get_timestamp()}][RANK] {SERVER_NAME} tem rank {rank}", flush=True)
+            return rank
+
+        if attempt < attempts - 1:
+            time.sleep(1)
+    print(f"[{get_timestamp()}][RANK] Não foi possível obter rank; seguindo sem referência", flush=True)
+    return None
+
+def send_heartbeat(context: zmq.Context) -> None:
+    response = call_reference(context, "heartbeat")
+    if response is None:
+        return
+    if response.get("status") != "success":
+        print(f"[{get_timestamp()}][HEARTBEAT] Rejeitado: {response.get('message', '')}", flush=True)
+        request_rank(context, attempts=1)
+        return
+    print(f"[{get_timestamp()}][HEARTBEAT] OK", flush=True)
 
 def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[str, object]:
     action = request.get("action")
@@ -93,8 +196,6 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
         channel = channel.strip()
         channels = load_channels()
 
-        # Com o broker, o canal pode ter sido criado em outro servidor;
-        # ele passa a ser registrado também neste.
         if channel not in channels:
             with CHANNELS_FILE.open("a", encoding="utf-8") as channel_file:
                 channel_file.write(f"{channel}\n")
@@ -105,6 +206,8 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
             "message": message,
             "timestamp": get_timestamp()
         }
+
+        publication["logical_clock"] = tick()
         if isinstance(username, str) and username.strip():
             publication["username"] = username.strip()
 
@@ -138,8 +241,6 @@ def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     context = zmq.Context()
     socket = context.socket(zmq.REP)
-    # Com BROKER_BACKEND definido, o servidor conecta no DEALER do broker;
-    # sem ele, atende os clientes diretamente na porta 5555.
     broker_backend = os.environ.get("BROKER_BACKEND")
     if broker_backend:
         socket.connect(broker_backend)
@@ -179,6 +280,10 @@ def main() -> None:
             })
             print(f"[{response['timestamp']}][ENVIADO] {dict_to_string(response)}", flush=True)
             socket.send(msgpack.packb(response, use_bin_type=True))
+
+            if REFERENCE_ENDPOINT and client_messages % HEARTBEAT_INTERVAL == 0:
+                send_heartbeat(context)
+
     finally:
         socket.close()
         publisher.close()
