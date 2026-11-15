@@ -82,7 +82,9 @@ async function main() {
             }
 
             logicalClock += 1;
-            response.timestamp = getTimestamp();
+            if (!request || request.action !== 'heartbeat') {
+                response.timestamp = getTimestamp();
+            }
             response.logical_clock = logicalClock;
             await socket.send(msgpack.encode(response));
         }
