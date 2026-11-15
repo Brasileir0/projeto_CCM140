@@ -13,7 +13,7 @@ find_package(Threads REQUIRED)
 
 add_executable(server server.cpp)
 target_include_directories(server PRIVATE ${libzmq_INCLUDE_DIRS} ${MSGPACK_INCLUDE_DIR})
-target_link_libraries(server PRIVATE ${libzmq_LIBRARIES})
+target_link_libraries(server PRIVATE ${libzmq_LIBRARIES} Threads::Threads)
 
 add_executable(client client.cpp)
 target_include_directories(client PRIVATE ${libzmq_INCLUDE_DIRS} ${MSGPACK_INCLUDE_DIR})

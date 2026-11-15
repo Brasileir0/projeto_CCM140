@@ -14,9 +14,11 @@
 
 // Serviço de referência (compatível com o reference.js): só conversa com os servidores.
 // - rank: devolve o rank do servidor (o mesmo nome recebe sempre o mesmo rank)
-// - heartbeat: mantém o servidor na lista ("Servidor não registrado" se ele não pediu rank)
+// - heartbeat: mantém o servidor na lista e responde só OK ("Servidor não registrado" se
+//   ele não pediu rank). Desde a parte 4 a hora correta vem do coordenador, então o
+//   heartbeat não responde mais com a hora.
 // - list: devolve os servidores disponíveis como lista de { name, rank }
-// Toda resposta leva timestamp (a hora correta, em ISO 8601 UTC) e logical_clock.
+// Toda resposta leva o timestamp de envio e o logical_clock, como qualquer mensagem.
 
 struct ServerInfo {
     long long rank;
@@ -40,7 +42,7 @@ std::string get_log_timestamp() {
     return ss.str();
 }
 
-// Hora correta enviada aos servidores: "AAAA-MM-DDTHH:MM:SS.mmmZ".
+// Timestamp de envio das respostas: "AAAA-MM-DDTHH:MM:SS.mmmZ".
 std::string get_iso_timestamp() {
     const auto now = std::chrono::system_clock::now();
     const auto milliseconds =
@@ -222,7 +224,6 @@ Response handle_request(std::map<std::string, std::string>& request) {
             it->second.available = true;
             response.status = "success";
             response.message = "OK";
-            response.rank = it->second.rank;
         }
     } else if (action == "list") {
         response.status = "success";

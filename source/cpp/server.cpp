@@ -2,35 +2,72 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
+#include <thread>
 #include <ctime>
 #include <filesystem>
 #include <unistd.h>
+#include <vector>
 #include <zmq.hpp>
 #include <msgpack.hpp>
 #include <map>
 
-// Relógio lógico (Lamport) do servidor.
+// Relógio lógico (Lamport) do servidor. A thread principal e a thread que atende
+// os outros servidores mexem nele, então fica protegido por mutex.
+std::mutex clock_mutex;
 long long logical_clock = 0;
 // Diferença, em ms, entre o relógio físico do servidor e o do sistema.
-// Começa com CLOCK_OFFSET_MS (atraso simulado) e é corrigida a cada heartbeat.
-long long clock_offset_ms = 0;
+// Começa com CLOCK_OFFSET_MS (atraso simulado) e é corrigida pela sincronização
+// com o coordenador (algoritmo de Berkeley).
+std::atomic<long long> clock_offset_ms(0);
+
 std::string server_name;
 std::string reference_endpoint;
+int peer_port = 5560;
+int my_rank = 0;
 int client_messages = 0;
 const int HEARTBEAT_INTERVAL = 10;
+const int CLOCK_SYNC_INTERVAL = 15;
+
+// Estado da eleição. "coordinator" é o nome do servidor eleito como coordenador.
+std::mutex state_mutex;
+std::string coordinator;
+std::atomic<bool> election_requested(false);
+// Servidores disponíveis segundo a referência: nome e rank.
+std::vector<std::pair<std::string, int>> known_servers;
+
+// As duas threads escrevem na tela; o mutex evita que as linhas se misturem.
+std::mutex output_mutex;
+
+template <typename... Args>
+void log_line(Args&&... args) {
+    std::ostringstream text;
+    (text << ... << args);
+    std::lock_guard<std::mutex> lock(output_mutex);
+    std::cout << text.str() << std::endl;
+}
+
+template <typename... Args>
+void log_error(Args&&... args) {
+    std::ostringstream text;
+    (text << ... << args);
+    std::lock_guard<std::mutex> lock(output_mutex);
+    std::cerr << text.str() << std::endl;
+}
 
 long long now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
                .count() +
-           clock_offset_ms;
+           clock_offset_ms.load();
 }
 
 std::string get_timestamp() {
@@ -43,19 +80,14 @@ std::string get_timestamp() {
     return ss.str();
 }
 
-// Converte "AAAA-MM-DDTHH:MM:SS.mmmZ" (ou com espaço no lugar do T) em ms desde a época.
-bool parse_timestamp_ms(const std::string& timestamp, long long& milliseconds) {
-    std::tm time{};
-    double seconds = 0;
-    if (std::sscanf(timestamp.c_str(), "%d-%d-%d%*c%d:%d:%lf", &time.tm_year, &time.tm_mon, &time.tm_mday,
-                    &time.tm_hour, &time.tm_min, &seconds) != 6) {
-        return false;
-    }
-    time.tm_year -= 1900;
-    time.tm_mon -= 1;
-    time.tm_sec = 0;
-    milliseconds = static_cast<long long>(timegm(&time)) * 1000 + static_cast<long long>(seconds * 1000);
-    return true;
+std::string get_coordinator() {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    return coordinator;
+}
+
+void set_coordinator(const std::string& name) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    coordinator = name;
 }
 
 std::string trim(const std::string& value) {
@@ -148,6 +180,7 @@ msgpack::sbuffer encode_message(std::map<std::string, std::string> fields, long 
 
 // Incrementa o relógio lógico antes de enviar uma mensagem.
 long long tick() {
+    std::lock_guard<std::mutex> lock(clock_mutex);
     return ++logical_clock;
 }
 
@@ -156,9 +189,17 @@ void update_clock(const std::map<std::string, std::string>& message) {
     const auto clock = message.find("logical_clock");
     if (clock == message.end()) return;
     try {
-        logical_clock = std::max(logical_clock, std::stoll(clock->second));
+        const long long received = std::stoll(clock->second);
+        std::lock_guard<std::mutex> lock(clock_mutex);
+        logical_clock = std::max(logical_clock, received);
     } catch (const std::exception&) {
     }
+}
+
+void send_message(zmq::socket_t& socket, const std::map<std::string, std::string>& fields, long long clock) {
+    msgpack::sbuffer buffer = encode_message(fields, clock);
+    zmq::message_t message(buffer.data(), buffer.size());
+    socket.send(message, zmq::send_flags::none);
 }
 
 void save_user(const std::string& username, const std::string& timestamp) {
@@ -187,6 +228,26 @@ std::set<std::string> load_channels() {
     return channels;
 }
 
+// "nome:rank;nome:rank" -> lista de (nome, rank).
+std::vector<std::pair<std::string, int>> parse_servers(const std::string& value) {
+    std::vector<std::pair<std::string, int>> servers;
+    std::stringstream stream(value);
+    std::string item;
+    while (std::getline(stream, item, ';')) {
+        const auto separator = item.rfind(':');
+        if (separator == std::string::npos) continue;
+        try {
+            servers.emplace_back(item.substr(0, separator), std::stoi(item.substr(separator + 1)));
+        } catch (const std::exception&) {
+        }
+    }
+    return servers;
+}
+
+// ---------------------------------------------------------------------------
+// Serviço de referência (rank, heartbeat e lista de servidores)
+// ---------------------------------------------------------------------------
+
 // Socket REQ para o serviço de referência. Se a referência não responder dentro
 // do timeout, o socket é recriado (um REQ sem resposta fica travado).
 std::unique_ptr<zmq::socket_t> reference_socket;
@@ -204,27 +265,23 @@ bool reference_request(zmq::context_t& context,
     request["name"] = server_name;
     request["timestamp"] = get_timestamp();
     const long long clock = tick();
-    std::cout << "[" << request["timestamp"] << "][REQ REFERÊNCIA] " << map_to_string(request)
-              << " | logical_clock: " << clock << std::endl;
-
-    msgpack::sbuffer buffer = encode_message(request, clock);
-    zmq::message_t message(buffer.data(), buffer.size());
-    reference_socket->send(message, zmq::send_flags::none);
+    log_line("[", request["timestamp"], "][REQ REFERÊNCIA] ", map_to_string(request), " | logical_clock: ", clock);
+    send_message(*reference_socket, request, clock);
 
     zmq::message_t reply;
     if (!reference_socket->recv(reply, zmq::recv_flags::none)) {
-        std::cerr << "[" << get_timestamp() << "][REFERÊNCIA ERRO] Sem resposta, reconectando" << std::endl;
+        log_error("[", get_timestamp(), "][REFERÊNCIA ERRO] Sem resposta, reconectando");
         connect_reference(context);
         return false;
     }
     try {
         response = decode_message(static_cast<const char*>(reply.data()), reply.size());
     } catch (const std::exception& error) {
-        std::cerr << "[" << get_timestamp() << "][REFERÊNCIA ERRO] Resposta inválida: " << error.what() << std::endl;
+        log_error("[", get_timestamp(), "][REFERÊNCIA ERRO] Resposta inválida: ", error.what());
         return false;
     }
     update_clock(response);
-    std::cout << "[" << get_timestamp() << "][REP REFERÊNCIA] " << map_to_string(response) << std::endl;
+    log_line("[", get_timestamp(), "][REP REFERÊNCIA] ", map_to_string(response));
     return response["status"] == "success";
 }
 
@@ -232,20 +289,30 @@ void request_rank(zmq::context_t& context) {
     while (true) {
         std::map<std::string, std::string> response;
         if (reference_request(context, {{"action", "rank"}}, response)) {
-            std::cout << "[" << get_timestamp() << "][RANK] " << server_name << " tem rank "
-                      << response["rank"] << std::endl;
+            try {
+                my_rank = std::stoi(response["rank"]);
+            } catch (const std::exception&) {
+            }
+            log_line("[", get_timestamp(), "][RANK] ", server_name, " tem rank ", my_rank);
             return;
         }
         sleep(1);
     }
 }
 
-// Heartbeat: mantém o servidor na lista da referência e aproveita a resposta
-// para acertar o relógio físico (algoritmo de Cristian: hora da referência +
-// metade do tempo de ida e volta).
+// Atualiza a lista de servidores disponíveis pela referência.
+void request_server_list(zmq::context_t& context) {
+    std::map<std::string, std::string> response;
+    if (reference_request(context, {{"action", "list"}}, response)) {
+        known_servers = parse_servers(response["servers"]);
+        log_line("[", get_timestamp(), "][SERVIDORES] ", response["servers"]);
+    }
+}
+
+// Heartbeat: mantém o servidor na lista da referência. A partir da parte 4 a hora
+// correta vem do coordenador, então a resposta do heartbeat não é usada para o relógio.
 void send_heartbeat(zmq::context_t& context) {
     std::map<std::string, std::string> response;
-    const long long sent_at = now_ms();
     if (!reference_request(context, {{"action", "heartbeat"}}, response)) {
         // A referência pode ter esquecido o servidor (por exemplo, se reiniciou).
         if (response["message"] == "Servidor não registrado") {
@@ -253,24 +320,271 @@ void send_heartbeat(zmq::context_t& context) {
         }
         return;
     }
-    const long long received_at = now_ms();
+    request_server_list(context);
 
-    long long reference_time = 0;
-    if (parse_timestamp_ms(response["timestamp"], reference_time)) {
-        const long long estimated_time = reference_time + (received_at - sent_at) / 2;
-        const long long adjustment = estimated_time - received_at;
-        clock_offset_ms += adjustment;
-        std::cout << "[" << get_timestamp() << "][RELÓGIO] Ajuste de " << adjustment
-                  << " ms (diferença atual para o sistema: " << clock_offset_ms << " ms)" << std::endl;
-    } else {
-        std::cerr << "[" << get_timestamp() << "][RELÓGIO ERRO] Hora inválida na resposta" << std::endl;
-    }
-
-    std::map<std::string, std::string> servers;
-    if (reference_request(context, {{"action", "list"}}, servers)) {
-        std::cout << "[" << get_timestamp() << "][SERVIDORES] " << servers["servers"] << std::endl;
+    // Se o coordenador saiu da lista da referência, é preciso eleger outro.
+    const std::string current = get_coordinator();
+    if (!current.empty() &&
+        std::none_of(known_servers.begin(), known_servers.end(),
+                     [&](const auto& server) { return server.first == current; })) {
+        log_line("[", get_timestamp(), "][ELEIÇÃO] Coordenador ", current, " não está mais na lista");
+        set_coordinator("");
+        election_requested = true;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Comunicação entre servidores (eleição e relógio)
+// ---------------------------------------------------------------------------
+
+// Diferenças de relógio (em ms) informadas pelos servidores ao coordenador,
+// usadas no algoritmo de Berkeley. Só a thread dos servidores mexe nisso.
+struct ClockReport {
+    long long difference_ms;
+    std::chrono::steady_clock::time_point received_at;
+};
+std::map<std::string, ClockReport> clock_reports;
+
+// Algoritmo de Berkeley no coordenador: a hora correta é a média dos relógios
+// conhecidos (o do coordenador e os informados pelos servidores nos últimos 60 s).
+// O coordenador também ajusta o próprio relógio para essa média.
+long long berkeley_correct_time(const std::string& requester, long long requester_time) {
+    const long long coordinator_time = now_ms();
+    const auto now = std::chrono::steady_clock::now();
+    clock_reports[requester] = {requester_time - coordinator_time, now};
+
+    for (auto it = clock_reports.begin(); it != clock_reports.end();) {
+        if (now - it->second.received_at > std::chrono::seconds(60)) {
+            it = clock_reports.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    long long sum = 0;  // a diferença do próprio coordenador é 0
+    for (const auto& [name, report] : clock_reports) {
+        sum += report.difference_ms;
+    }
+    const long long average = sum / static_cast<long long>(clock_reports.size() + 1);
+
+    // O coordenador anda "average" ms; as diferenças guardadas passam a ser relativas
+    // ao novo relógio. Quem pediu vai acertar o relógio para a hora correta (diferença 0).
+    clock_offset_ms += average;
+    for (auto& [name, report] : clock_reports) {
+        report.difference_ms -= average;
+    }
+    clock_reports[requester].difference_ms = 0;
+
+    log_line("[", get_timestamp(), "][BERKELEY] Média de ", clock_reports.size() + 1,
+             " relógios; ajuste do coordenador: ", average, " ms");
+    return coordinator_time + average;
+}
+
+// Thread que atende os pedidos de outros servidores (eleição e relógio) num socket REP
+// próprio, para não depender da thread principal, que pode estar esperando outro servidor.
+void peer_loop(zmq::context_t& context) {
+    zmq::socket_t socket(context, zmq::socket_type::rep);
+    socket.bind("tcp://*:" + std::to_string(peer_port));
+    log_line("[Servidor C++] Atendendo outros servidores na porta ", peer_port);
+
+    while (true) {
+        zmq::message_t request;
+        if (!socket.recv(request, zmq::recv_flags::none)) {
+            continue;
+        }
+
+        std::map<std::string, std::string> reply;
+        try {
+            std::map<std::string, std::string> fields =
+                decode_message(static_cast<const char*>(request.data()), request.size());
+            update_clock(fields);
+            log_line("[", get_timestamp(), "][RECEBIDO SERVIDOR] ", map_to_string(fields));
+            const std::string action = fields["action"];
+
+            if (action == "election") {
+                // Quem recebe o pedido responde OK e começa a sua própria eleição.
+                reply["status"] = "success";
+                reply["message"] = "OK";
+                election_requested = true;
+                log_line("[", get_timestamp(), "][ELEIÇÃO] Pedido de ", fields["name"], " (rank ",
+                         fields["rank"], "); respondendo OK");
+            } else if (action == "clock") {
+                const std::string current = get_coordinator();
+                if (current != server_name) {
+                    reply["status"] = "error";
+                    reply["message"] = "Não sou o coordenador";
+                    reply["coordinator"] = current;
+                } else {
+                    const long long correct_time = berkeley_correct_time(fields["name"], std::stoll(fields["time"]));
+                    reply["status"] = "success";
+                    reply["time"] = std::to_string(correct_time);
+                    reply["coordinator"] = server_name;
+                }
+            } else {
+                reply["status"] = "error";
+                reply["message"] = "Ação desconhecida";
+            }
+        } catch (const std::exception& error) {
+            reply["status"] = "error";
+            reply["message"] = "Requisição inválida";
+            log_error("[", get_timestamp(), "][ERRO] Pedido de servidor inválido: ", error.what());
+        }
+
+        reply["timestamp"] = get_timestamp();
+        const long long clock = tick();
+        log_line("[", reply["timestamp"], "][ENVIADO SERVIDOR] ", map_to_string(reply), " | logical_clock: ", clock);
+        send_message(socket, reply, clock);
+    }
+}
+
+std::string peer_endpoint(const std::string& name) {
+    return "tcp://" + name + ":" + std::to_string(peer_port);
+}
+
+// Publica no tópico "servers" que este servidor é o coordenador.
+void announce_coordinator(zmq::socket_t& pub_socket) {
+    set_coordinator(server_name);
+    std::map<std::string, std::string> announcement = {
+        {"coordinator", server_name},
+        {"rank", std::to_string(my_rank)},
+        {"timestamp", get_timestamp()}};
+    const long long clock = tick();
+    msgpack::sbuffer buffer = encode_message(announcement, clock);
+    const std::string topic = "servers";
+    zmq::message_t topic_msg(topic.data(), topic.size());
+    zmq::message_t content_msg(buffer.data(), buffer.size());
+    pub_socket.send(topic_msg, zmq::send_flags::sndmore);
+    pub_socket.send(content_msg, zmq::send_flags::none);
+    log_line("[", announcement["timestamp"], "][COORDENADOR] Eleito; publicado em [servers] ",
+             map_to_string(announcement), " | logical_clock: ", clock);
+}
+
+// Algoritmo do valentão (bully): pede eleição a todos os servidores de rank maior.
+// Se nenhum responder OK, este servidor é o novo coordenador; se algum responder,
+// espera o anúncio dele no tópico "servers".
+// Devolve true se algum servidor de rank maior respondeu.
+bool start_election(zmq::context_t& context, zmq::socket_t& pub_socket) {
+    request_server_list(context);
+    std::vector<std::pair<std::string, int>> higher;
+    for (const auto& server : known_servers) {
+        if (server.second > my_rank && server.first != server_name) {
+            higher.push_back(server);
+        }
+    }
+    log_line("[", get_timestamp(), "][ELEIÇÃO] Iniciando eleição (meu rank: ", my_rank, "); pedindo a ",
+             higher.size(), " servidor(es) de rank maior");
+
+    // Os pedidos são enviados a todos de uma vez e as respostas esperadas por até 1 s.
+    std::vector<std::unique_ptr<zmq::socket_t>> sockets;
+    for (const auto& [name, rank] : higher) {
+        auto socket = std::make_unique<zmq::socket_t>(context, zmq::socket_type::req);
+        socket->set(zmq::sockopt::linger, 0);
+        socket->connect(peer_endpoint(name));
+        std::map<std::string, std::string> request = {
+            {"action", "election"}, {"name", server_name}, {"rank", std::to_string(my_rank)},
+            {"timestamp", get_timestamp()}};
+        const long long clock = tick();
+        log_line("[", request["timestamp"], "][REQ SERVIDOR] para ", name, ": ", map_to_string(request),
+                 " | logical_clock: ", clock);
+        send_message(*socket, request, clock);
+        sockets.push_back(std::move(socket));
+    }
+
+    bool someone_answered = false;
+    std::vector<bool> answered(sockets.size(), false);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    while (!sockets.empty() && std::chrono::steady_clock::now() < deadline) {
+        std::vector<zmq::pollitem_t> items;
+        for (const auto& socket : sockets) {
+            items.push_back({socket->handle(), 0, ZMQ_POLLIN, 0});
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        zmq::poll(items.data(), items.size(), std::max(remaining, std::chrono::milliseconds(0)));
+
+        bool pending = false;
+        for (std::size_t i = 0; i < sockets.size(); ++i) {
+            if (answered[i]) continue;
+            if (!(items[i].revents & ZMQ_POLLIN)) {
+                pending = true;
+                continue;
+            }
+            zmq::message_t reply;
+            if (!sockets[i]->recv(reply, zmq::recv_flags::none)) continue;
+            answered[i] = true;
+            try {
+                auto fields = decode_message(static_cast<const char*>(reply.data()), reply.size());
+                update_clock(fields);
+                log_line("[", get_timestamp(), "][REP SERVIDOR] de ", higher[i].first, ": ", map_to_string(fields));
+                if (fields["status"] == "success") someone_answered = true;
+            } catch (const std::exception&) {
+            }
+        }
+        if (!pending) break;
+    }
+
+    if (someone_answered) {
+        log_line("[", get_timestamp(), "][ELEIÇÃO] Servidor de rank maior respondeu; aguardando o anúncio do coordenador");
+    } else {
+        announce_coordinator(pub_socket);
+    }
+    return someone_answered;
+}
+
+// Sincronização com o coordenador a cada 15 mensagens: "REQ: relógio" -> "REP: hora correta".
+// O servidor envia a sua hora; o coordenador responde a hora correta (Berkeley) e o
+// servidor acerta o relógio somando metade do tempo de ida e volta.
+void synchronize_with_coordinator(zmq::context_t& context) {
+    const std::string current = get_coordinator();
+    if (current.empty() || current == server_name) {
+        return;
+    }
+
+    zmq::socket_t socket(context, zmq::socket_type::req);
+    socket.set(zmq::sockopt::linger, 0);
+    socket.set(zmq::sockopt::rcvtimeo, 1000);
+    socket.connect(peer_endpoint(current));
+
+    const long long sent_at = now_ms();
+    std::map<std::string, std::string> request = {
+        {"action", "clock"}, {"name", server_name}, {"time", std::to_string(sent_at)},
+        {"timestamp", get_timestamp()}};
+    const long long clock = tick();
+    log_line("[", request["timestamp"], "][REQ SERVIDOR] para ", current, ": ", map_to_string(request),
+             " | logical_clock: ", clock);
+    send_message(socket, request, clock);
+
+    zmq::message_t reply;
+    if (!socket.recv(reply, zmq::recv_flags::none)) {
+        log_line("[", get_timestamp(), "][ELEIÇÃO] Coordenador ", current, " não respondeu; pedindo eleição");
+        set_coordinator("");
+        election_requested = true;
+        return;
+    }
+    const long long received_at = now_ms();
+
+    try {
+        auto fields = decode_message(static_cast<const char*>(reply.data()), reply.size());
+        update_clock(fields);
+        log_line("[", get_timestamp(), "][REP SERVIDOR] de ", current, ": ", map_to_string(fields));
+        if (fields["status"] != "success") {
+            set_coordinator("");
+            election_requested = true;
+            return;
+        }
+        const long long estimated_time = std::stoll(fields["time"]) + (received_at - sent_at) / 2;
+        const long long adjustment = estimated_time - received_at;
+        clock_offset_ms += adjustment;
+        log_line("[", get_timestamp(), "][RELÓGIO] Ajuste de ", adjustment, " ms pelo coordenador ", current,
+                 " (diferença atual para o sistema: ", clock_offset_ms.load(), " ms)");
+    } catch (const std::exception& error) {
+        log_error("[", get_timestamp(), "][RELÓGIO ERRO] Resposta inválida do coordenador: ", error.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Requisições dos clientes
+// ---------------------------------------------------------------------------
 
 std::map<std::string, std::string> handle_request(std::map<std::string, std::string>& req_map,
                                                   zmq::socket_t& pub_socket) {
@@ -281,17 +595,17 @@ std::map<std::string, std::string> handle_request(std::map<std::string, std::str
     if (request_timestamp.empty()) {
         rep_map["status"] = "error";
         rep_map["message"] = "Timestamp ausente";
-        std::cout << "[" << get_timestamp() << "][ERRO] Timestamp ausente" << std::endl;
+        log_line("[", get_timestamp(), "][ERRO] Timestamp ausente");
     }
     else if (action == "login") {
         std::string username = trim(req_map["username"]);
         if (username.empty()) {
             rep_map["status"] = "error";
             rep_map["message"] = "Nome de usuário inválido";
-            std::cout << "[" << request_timestamp << "][LOGIN ERRO] Nome inválido" << std::endl;
+            log_line("[", request_timestamp, "][LOGIN ERRO] Nome inválido");
         } else {
             save_user(username, request_timestamp);
-            std::cout << "[" << request_timestamp << "][LOGIN] Usuário: " << username << std::endl;
+            log_line("[", request_timestamp, "][LOGIN] Usuário: ", username);
             rep_map["status"] = "success";
             rep_map["message"] = "Login realizado com sucesso";
         }
@@ -302,16 +616,16 @@ std::map<std::string, std::string> handle_request(std::map<std::string, std::str
         if (channel.empty()) {
             rep_map["status"] = "error";
             rep_map["message"] = "Nome de canal inválido";
-            std::cout << "[" << request_timestamp << "][CANAL ERRO] Nome inválido" << std::endl;
+            log_line("[", request_timestamp, "][CANAL ERRO] Nome inválido");
         } else if (channels.find(channel) == channels.end()) {
             save_channel(channel);
-            std::cout << "[" << request_timestamp << "][CHANNEL] Canal criado: " << channel << std::endl;
+            log_line("[", request_timestamp, "][CHANNEL] Canal criado: ", channel);
             rep_map["status"] = "success";
             rep_map["message"] = "Canal criado com sucesso";
         } else {
             rep_map["status"] = "error";
             rep_map["message"] = "Canal já existe";
-            std::cout << "[" << request_timestamp << "][CANAL ERRO] Já existe: " << channel << std::endl;
+            log_line("[", request_timestamp, "][CANAL ERRO] Já existe: ", channel);
         }
     }
     else if (action == "list_channels") {
@@ -323,7 +637,7 @@ std::map<std::string, std::string> handle_request(std::map<std::string, std::str
         }
         rep_map["status"] = "success";
         rep_map["channels"] = channel_list;
-        std::cout << "[" << request_timestamp << "][CANAIS] Lista enviada: " << channel_list << std::endl;
+        log_line("[", request_timestamp, "][CANAIS] Lista enviada: ", channel_list);
     }
     else if (action == "publish") {
         std::string channel = trim(req_map["channel"]);
@@ -334,13 +648,13 @@ std::map<std::string, std::string> handle_request(std::map<std::string, std::str
         if (channel.empty() || trim(message).empty()) {
             rep_map["status"] = "error";
             rep_map["message"] = "Canal ou mensagem inválidos";
-            std::cout << "[" << request_timestamp << "][PUB ERRO] Canal ou mensagem inválidos" << std::endl;
+            log_line("[", request_timestamp, "][PUB ERRO] Canal ou mensagem inválidos");
         } else {
             // Com o broker, o canal pode ter sido criado em outro servidor;
             // ele passa a ser registrado também neste.
             if (channels.find(channel) == channels.end()) {
                 save_channel(channel);
-                std::cout << "[" << request_timestamp << "][CHANNEL] Canal registrado a partir de publicação: " << channel << std::endl;
+                log_line("[", request_timestamp, "][CHANNEL] Canal registrado a partir de publicação: ", channel);
             }
             const std::string publication_timestamp = get_timestamp();
             save_message(channel, username, message, request_timestamp, publication_timestamp);
@@ -361,17 +675,35 @@ std::map<std::string, std::string> handle_request(std::map<std::string, std::str
 
             rep_map["status"] = "success";
             rep_map["message"] = "Mensagem publicada com sucesso";
-            std::cout << "[" << publication_timestamp << "][PUB] " << map_to_string(publication)
-                      << " | logical_clock: " << clock << std::endl;
+            log_line("[", publication_timestamp, "][PUB] ", map_to_string(publication), " | logical_clock: ", clock);
         }
     }
     else {
         rep_map["status"] = "error";
         rep_map["message"] = "Ação desconhecida";
-        std::cout << "[" << request_timestamp << "][ERRO] Ação desconhecida: " << action << std::endl;
+        log_line("[", request_timestamp, "][ERRO] Ação desconhecida: ", action);
     }
 
     return rep_map;
+}
+
+// Anúncio recebido no tópico "servers": guarda o nome do coordenador.
+void handle_announcement(const std::map<std::string, std::string>& fields) {
+    const auto name = fields.find("coordinator");
+    if (name == fields.end() || name->second.empty()) return;
+    set_coordinator(name->second);
+    log_line("[", get_timestamp(), "][COORDENADOR] Novo coordenador: ", name->second, " ", map_to_string(fields));
+
+    // No algoritmo do valentão, um servidor de rank maior assume no lugar de um menor.
+    const auto rank = fields.find("rank");
+    if (name->second != server_name && rank != fields.end()) {
+        try {
+            if (std::stoi(rank->second) < my_rank) {
+                election_requested = true;
+            }
+        } catch (const std::exception&) {
+        }
+    }
 }
 
 int main() {
@@ -381,74 +713,140 @@ int main() {
     gethostname(hostname, sizeof(hostname) - 1);
     const char* configured_name = std::getenv("SERVER_NAME");
     server_name = configured_name ? configured_name : hostname;
-    // Sem REFERENCE_ENDPOINT o servidor funciona sem o serviço de referência.
+    // Sem REFERENCE_ENDPOINT o servidor funciona sem o serviço de referência (e sem eleição).
     const char* configured_reference = std::getenv("REFERENCE_ENDPOINT");
     reference_endpoint = configured_reference ? configured_reference : "";
     const char* configured_offset = std::getenv("CLOCK_OFFSET_MS");
     if (configured_offset) {
         clock_offset_ms = std::atoll(configured_offset);
     }
+    const char* configured_peer_port = std::getenv("PEER_PORT");
+    if (configured_peer_port) {
+        peer_port = std::atoi(configured_peer_port);
+    }
 
     zmq::context_t context(1);
     zmq::socket_t socket(context, zmq::socket_type::rep);
     zmq::socket_t pub_socket(context, zmq::socket_type::pub);
+    zmq::socket_t sub_socket(context, zmq::socket_type::sub);
 
     // Com BROKER_BACKEND definido, o servidor conecta no DEALER do broker;
     // sem ele, atende os clientes diretamente na porta 5555.
     const char* broker_backend = std::getenv("BROKER_BACKEND");
     if (broker_backend) {
         socket.connect(broker_backend);
-        std::cout << "[Servidor C++] " << server_name << " conectado ao broker em " << broker_backend << std::endl;
+        log_line("[Servidor C++] ", server_name, " conectado ao broker em ", broker_backend);
     } else {
         socket.bind("tcp://*:5555");
-        std::cout << "[Servidor C++] " << server_name << " iniciado na porta 5555..." << std::endl;
+        log_line("[Servidor C++] ", server_name, " iniciado na porta 5555...");
     }
 
     const char* pubsub_xsub = std::getenv("PUBSUB_XSUB_ENDPOINT");
     pub_socket.connect(pubsub_xsub ? pubsub_xsub : "tcp://proxy-pubsub:5557");
-    std::cout << "[Servidor C++] Publisher conectado ao proxy Pub/Sub" << std::endl;
+    // O servidor também assina o tópico "servers" para saber quem é o coordenador.
+    const char* pubsub_xpub = std::getenv("PUBSUB_XPUB_ENDPOINT");
+    sub_socket.connect(pubsub_xpub ? pubsub_xpub : "tcp://proxy-pubsub:5558");
+    sub_socket.set(zmq::sockopt::subscribe, "servers");
+    log_line("[Servidor C++] Publisher conectado ao proxy Pub/Sub e inscrito no tópico servers");
     if (clock_offset_ms != 0) {
-        std::cout << "[" << get_timestamp() << "][RELÓGIO] Iniciando com atraso simulado de "
-                  << clock_offset_ms << " ms" << std::endl;
+        log_line("[", get_timestamp(), "][RELÓGIO] Iniciando com atraso simulado de ", clock_offset_ms.load(), " ms");
     }
 
-    if (!reference_endpoint.empty()) {
+    const bool use_reference = !reference_endpoint.empty();
+    if (use_reference) {
         connect_reference(context);
         request_rank(context);
+        std::thread(peer_loop, std::ref(context)).detach();
+        // Dá tempo de a inscrição no tópico "servers" chegar ao proxy antes da eleição.
+        sleep(1);
+        election_requested = true;
     }
 
+    auto waiting_announcement_until = std::chrono::steady_clock::time_point::min();
+    auto last_election = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+
     while (true) {
-        zmq::message_t request;
-        if (!socket.recv(request, zmq::recv_flags::none)) {
+        zmq::pollitem_t items[] = {{socket.handle(), 0, ZMQ_POLLIN, 0}, {sub_socket.handle(), 0, ZMQ_POLLIN, 0}};
+        zmq::poll(items, 2, std::chrono::milliseconds(500));
+
+        // Anúncios de coordenador no tópico "servers".
+        if (items[1].revents & ZMQ_POLLIN) {
+            zmq::message_t topic_frame;
+            zmq::message_t content_frame;
+            if (sub_socket.recv(topic_frame, zmq::recv_flags::none) && topic_frame.more() &&
+                sub_socket.recv(content_frame, zmq::recv_flags::none)) {
+                const std::string topic(static_cast<const char*>(topic_frame.data()), topic_frame.size());
+                if (topic == "servers") {
+                    try {
+                        auto fields = decode_message(static_cast<const char*>(content_frame.data()), content_frame.size());
+                        update_clock(fields);
+                        handle_announcement(fields);
+                        waiting_announcement_until = std::chrono::steady_clock::time_point::min();
+                    } catch (const std::exception& error) {
+                        log_error("[", get_timestamp(), "][ERRO] Anúncio inválido: ", error.what());
+                    }
+                }
+            }
+        }
+
+        // Requisições dos clientes.
+        if (items[0].revents & ZMQ_POLLIN) {
+            zmq::message_t request;
+            if (socket.recv(request, zmq::recv_flags::none)) {
+                std::map<std::string, std::string> rep_map;
+                try {
+                    std::map<std::string, std::string> req_map =
+                        decode_message(static_cast<const char*>(request.data()), request.size());
+                    update_clock(req_map);
+                    log_line("[", get_timestamp(), "][RECEBIDO] ", map_to_string(req_map));
+                    rep_map = handle_request(req_map, pub_socket);
+                } catch (const std::exception& error) {
+                    rep_map["status"] = "error";
+                    rep_map["message"] = "Requisição inválida";
+                    log_error("[", get_timestamp(), "][ERRO] Requisição inválida: ", error.what());
+                }
+
+                rep_map["timestamp"] = get_timestamp();
+                const long long clock = tick();
+                log_line("[", rep_map["timestamp"], "][ENVIADO] ", map_to_string(rep_map), " | logical_clock: ", clock);
+                send_message(socket, rep_map, clock);
+
+                client_messages++;
+                if (use_reference) {
+                    // A cada 10 mensagens de clientes, avisa a referência que está ativo.
+                    if (client_messages % HEARTBEAT_INTERVAL == 0) {
+                        send_heartbeat(context);
+                    }
+                    // A cada 15 mensagens, sincroniza o relógio com o coordenador.
+                    if (client_messages % CLOCK_SYNC_INTERVAL == 0) {
+                        synchronize_with_coordinator(context);
+                    }
+                }
+            }
+        }
+
+        if (!use_reference) {
             continue;
         }
 
-        std::map<std::string, std::string> rep_map;
-        try {
-            std::map<std::string, std::string> req_map =
-                decode_message(static_cast<const char*>(request.data()), request.size());
-            update_clock(req_map);
-            std::cout << "[" << get_timestamp() << "][RECEBIDO] " << map_to_string(req_map) << std::endl;
-            rep_map = handle_request(req_map, pub_socket);
-        } catch (const std::exception& error) {
-            rep_map["status"] = "error";
-            rep_map["message"] = "Requisição inválida";
-            std::cerr << "[" << get_timestamp() << "][ERRO] Requisição inválida: " << error.what() << std::endl;
+        // Se um servidor de rank maior respondeu mas o anúncio não chegou, tenta de novo.
+        const auto now = std::chrono::steady_clock::now();
+        if (waiting_announcement_until != std::chrono::steady_clock::time_point::min() &&
+            now > waiting_announcement_until) {
+            log_line("[", get_timestamp(), "][ELEIÇÃO] Anúncio do coordenador não chegou; repetindo a eleição");
+            waiting_announcement_until = std::chrono::steady_clock::time_point::min();
+            election_requested = true;
         }
 
-        rep_map["timestamp"] = get_timestamp();
-        const long long clock = tick();
-        std::cout << "[" << rep_map["timestamp"] << "][ENVIADO] " << map_to_string(rep_map)
-                  << " | logical_clock: " << clock << std::endl;
-
-        msgpack::sbuffer sbuf = encode_message(rep_map, clock);
-        zmq::message_t reply(sbuf.data(), sbuf.size());
-        socket.send(reply, zmq::send_flags::none);
-
-        // A cada 10 mensagens de clientes, avisa a referência que está ativo.
-        client_messages++;
-        if (!reference_endpoint.empty() && client_messages % HEARTBEAT_INTERVAL == 0) {
-            send_heartbeat(context);
+        // Eleição pedida por outro servidor, por falha do coordenador ou por não haver coordenador.
+        const bool no_coordinator = get_coordinator().empty() &&
+                                    waiting_announcement_until == std::chrono::steady_clock::time_point::min();
+        if ((election_requested || no_coordinator) && now - last_election > std::chrono::seconds(3)) {
+            election_requested = false;
+            last_election = now;
+            if (start_election(context, pub_socket)) {
+                waiting_announcement_until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            }
         }
     }
 
