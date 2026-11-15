@@ -8,31 +8,38 @@ HEARTBEAT_TIMEOUT_MS = int(os.environ.get("HEARTBEAT_TIMEOUT_MS", "30000"))
 BIND_ENDPOINT = os.environ.get("REFERENCE_BIND_ENDPOINT", "tcp://*:5559")
 
 ranks: dict[str, int] = {}
-available: dict[str, int] = {}
+available: dict[str, float] = {}
 next_rank = 1
 logical_clock = 0
+
 
 def get_log_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def get_iso_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def dict_to_string(values: dict) -> str:
     return "{ " + " | ".join(f"{key}: {values[key]}" for key in sorted(values)) + " }"
 
-def observe_logical_clock(valuer: object) -> None:
+def observe_logical_clock(value: object) -> None:
     global logical_clock
-    if isistance(value, int) and not isistance(value, bool) and value >= 0:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         logical_clock = max(logical_clock, value)
+
 
 def remove_expired_servers() -> None:
     now = time.monotonic()
-    for name, last_seen in list(avaible.items()):
-        if(now - last_seen) * 1000 > HEARTBEAT_TIMEOUT_MS:
+    for name, last_seen in list(available.items()):
+        if (now - last_seen) * 1000 > HEARTBEAT_TIMEOUT_MS:
             del available[name]
             print(
                 f"[{get_log_timestamp()}][REMOVIDO] {name} (rank {ranks[name]}) "
                 f"sem heartbeat há mais de {HEARTBEAT_TIMEOUT_MS // 1000}s",
-                flush=True
+                flush=True,
             )
+
 
 def handle_request(request: dict) -> dict:
     global next_rank
@@ -82,13 +89,13 @@ def main() -> None:
 
     try:
         while True:
-            # Timeout para conseguir remover servidores mesmo sem receber mensagens.
             events = dict(poller.poll(1000))
             remove_expired_servers()
             if socket not in events:
                 continue
 
             raw_request = socket.recv()
+            request = None
             try:
                 request = msgpack.unpackb(raw_request, raw=False)
                 if not isinstance(request, dict):
@@ -101,7 +108,9 @@ def main() -> None:
                 response = {"status": "error", "message": "Requisição inválida"}
 
             logical_clock += 1
-            response["timestamp"] = get_iso_timestamp()
+            # O heartbeat não devolve a hora (parte 4).
+            if not (isinstance(request, dict) and request.get("action") == "heartbeat"):
+                response["timestamp"] = get_iso_timestamp()
             response["logical_clock"] = logical_clock
             print(f"[{get_log_timestamp()}][ENVIADO] {dict_to_string(response)}", flush=True)
             socket.send(msgpack.packb(response, use_bin_type=True))
@@ -110,7 +119,6 @@ def main() -> None:
     finally:
         socket.close()
         context.term()
-
 
 if __name__ == "__main__":
     main()
