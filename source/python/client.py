@@ -15,6 +15,21 @@ pending_subscriptions: "queue.Queue[str]" = queue.Queue()
 # As duas threads escrevem na tela; o lock evita que as linhas se misturem.
 output_lock = threading.Lock()
 
+logical_clock = 0
+clock_lock = threading.Lock()
+
+def tick() -> int:
+    global logical_clock
+    with clock_lock:
+        logical_clock += 1
+        return logical_clock
+
+def observe_logical_clock(value: object) -> int:
+    global logical_clock
+    with clock_lock:
+        if isistance(value, int) and not isistance(value, bool) and value >= 0:
+            logical_clock = max(logical_clock, value)
+        return logical_clock
 
 def log(text: str) -> None:
     with output_lock:
@@ -25,7 +40,7 @@ def get_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# Normaliza os timestamps dos servidores (ISO do Python/JS ou "data hora" do C++)
+# Normaliza os timestamps dos servidores
 # para "AAAA-MM-DD HH:MM:SS".
 def format_timestamp(timestamp: object) -> str:
     if not isinstance(timestamp, str):
