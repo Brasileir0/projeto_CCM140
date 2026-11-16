@@ -6,6 +6,7 @@ const path = require('path');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const USERS_FILE = path.join(DATA_DIR, 'users.txt');
 const CHANNELS_FILE = path.join(DATA_DIR, 'channels.txt');
+const MESSAGES_FILE = path.join(DATA_DIR, 'messages.txt');
 const EVENTS_FILE = path.join(DATA_DIR, 'events.jsonl');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -16,9 +17,13 @@ let coordinatorName = null;
 let serverRank = null;
 let electionInProgress = false;
 let serverName;
+let replicationPrefix;
+let replicationSequence = 0;
+const appliedReplications = new Set();
 
 const CLOCK_SYNC_INTERVAL = 15;
 const PEER_PORT = Number(process.env.PEER_PORT) || 5560;
+const REPLICATION_TOPIC = 'replication';
 
 function getTimestamp() {
     return new Date(Date.now() + physicalClockOffset).toISOString();
@@ -43,13 +48,161 @@ function persistEvent(event) {
     fs.appendFileSync(EVENTS_FILE, `${JSON.stringify(event)}\n`, 'utf8');
 }
 
+function appendUniqueLine(file, line) {
+    const lines = fs.existsSync(file)
+        ? fs.readFileSync(file, 'utf8').split(/\r?\n/)
+        : [];
+
+    if (lines.includes(line)) {
+        return false;
+    }
+
+    fs.appendFileSync(file, `${line}\n`, 'utf8');
+    return true;
+}
+
 function saveUser(username, timestamp) {
-    fs.appendFileSync(USERS_FILE, `${username},${timestamp}\n`, 'utf8');
+    return appendUniqueLine(USERS_FILE, `${username},${timestamp}`);
 }
 
 function saveChannel(channel, timestamp) {
-    fs.appendFileSync(CHANNELS_FILE, `${channel}\n`, 'utf8');
+
+    if (!appendUniqueLine(CHANNELS_FILE, channel)) {
+        return false;
+    }
     persistEvent({ type: 'channel_created', channel, timestamp });
+    return true;
+}
+
+function saveMessage(channel, username, message, requestTimestamp, publicationTimestamp) {
+    return appendUniqueLine(
+        MESSAGES_FILE,
+        `${channel}|${username}|${message}|${requestTimestamp}|${publicationTimestamp}`
+    );
+}
+
+function migratePublicationEvents() {
+
+    if (!fs.existsSync(EVENTS_FILE)) {
+        return;
+    }
+
+    let migrated = 0;
+    const lines = fs.readFileSync(EVENTS_FILE, 'utf8').split(/\r?\n/).filter(Boolean);
+    for (const [index, line] of lines.entries()) {
+        let event;
+        try {
+            event = JSON.parse(line);
+        } catch (error) {
+            console.error(`[Servidor JS] Evento inválido em ${EVENTS_FILE}:${index + 1}:`, error);
+            continue;
+        }
+
+        if (!event || typeof event !== 'object') {
+            console.error(`[Servidor JS] Evento inválido em ${EVENTS_FILE}:${index + 1}`);
+            continue;
+        }
+
+        if (event.type === 'publication' &&
+            typeof event.channel === 'string' &&
+            typeof event.message === 'string' &&
+            typeof event.requestTimestamp === 'string' &&
+            typeof event.timestamp === 'string') {
+
+            if (saveMessage(
+                event.channel,
+                typeof event.username === 'string' ? event.username : '',
+                event.message,
+                event.requestTimestamp,
+                event.timestamp
+            )) {
+                migrated += 1;
+            }
+        }
+    }
+
+    if (migrated) {
+        console.log(`[Servidor JS] ${migrated} publicação(ões) anterior(es) recuperada(s) para a replicação`);
+    }
+}
+
+function dumpLines(file) {
+
+    if (!fs.existsSync(file)) {
+        return '';
+    }
+
+    const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean);
+    return lines.length ? `${lines.join('\n')}\n` : '';
+}
+
+function mergeLines(file, contents) {
+
+    if (typeof contents !== 'string') {
+        return 0;
+    }
+
+    let added = 0;
+    for (const line of contents.split(/\r?\n/).filter(Boolean)) {
+        if (appendUniqueLine(file, line)) {
+            added += 1;
+        }
+    }
+    return added;
+}
+
+async function publishReplication(publisher, fields) {
+    const replication = {
+        ...fields,
+        origin: serverName,
+        id: `${replicationPrefix}:${++replicationSequence}`,
+        timestamp: getTimestamp(),
+        logical_clock: tickLogicalClock()
+    };
+    await publisher.send([Buffer.from(REPLICATION_TOPIC), msgpack.encode(replication)]);
+    console.log(`[${replication.timestamp}][REPLICAÇÃO] Enviado: ${objectToString(replication)}`);
+}
+
+function applyReplication(replication) {
+    const origin = typeof replication.origin === 'string' ? replication.origin : '';
+    const id = typeof replication.id === 'string' ? replication.id : '';
+
+    if (origin === serverName || (id && appliedReplications.has(id))) {
+        return;
+    }
+
+    const type = replication.type;
+    let stored = false;
+
+    if (type === 'login' &&
+        typeof replication.username === 'string' &&
+        typeof replication.login_timestamp === 'string') {
+        stored = saveUser(replication.username, replication.login_timestamp);
+    } else if (type === 'channel' && typeof replication.channel === 'string') {
+        stored = saveChannel(replication.channel, replication.timestamp);
+    } else if (type === 'publication' &&
+        typeof replication.channel === 'string' &&
+        typeof replication.username === 'string' &&
+        typeof replication.message === 'string' &&
+        typeof replication.request_timestamp === 'string' &&
+        typeof replication.publication_timestamp === 'string') {
+        saveChannel(replication.channel, replication.publication_timestamp);
+        stored = saveMessage(
+            replication.channel,
+            replication.username,
+            replication.message,
+            replication.request_timestamp,
+            replication.publication_timestamp
+        );
+    } else {
+        console.error(`[${getTimestamp()}][REPLICAÇÃO] Mensagem inválida recebida de ${origin}`);
+        return;
+    }
+
+    if (id) {
+        appliedReplications.add(id);
+    }
+    console.log(`[${getTimestamp()}][REPLICAÇÃO] Recebido de ${origin} (${type}, ${stored ? 'gravado' : 'já existia'})`);
 }
 
 function loadChannels() {
@@ -134,6 +287,13 @@ async function handlePeerRequests(peerSocket) {
                 response = { status: 'success', message: 'OK' };
             } else if (request.action === 'clock') {
                 response = { status: 'success', timestamp: getTimestamp() };
+            } else if (request.action === 'sync') {
+                response = {
+                    status: 'success',
+                    users: dumpLines(USERS_FILE),
+                    channels: dumpLines(CHANNELS_FILE),
+                    messages: dumpLines(MESSAGES_FILE)
+                };
             } else {
                 response = { status: 'error', message: 'Ação desconhecida' };
             }
@@ -152,26 +312,63 @@ async function handlePeerRequests(peerSocket) {
     }
 }
 
-async function listenForCoordinatorAnnouncements(subscriber) {
+async function listenForPubSubMessages(subscriber) {
     for await (const frames of subscriber) {
         if (frames.length < 2) {
             continue;
         }
 
         try {
-            const announcement = msgpack.decode(frames[1]);
-            observeLogicalClock(announcement && announcement.logical_clock);
-            const announcedName = typeof announcement === 'string'
-                ? announcement
-                : announcement && (announcement.coordinator || announcement.name);
-            if (typeof announcedName === 'string' && announcedName.trim()) {
-                coordinatorName = announcedName.trim();
-                console.log(`[Servidor JS] Coordenador anunciado: ${coordinatorName}`);
+            const topic = frames[0].toString();
+            const message = msgpack.decode(frames[1]);
+            observeLogicalClock(message && message.logical_clock);
+
+            if (topic === 'servers') {
+                const announcedName = typeof message === 'string'
+                    ? message
+                    : message && (message.coordinator || message.name);
+
+                if (typeof announcedName === 'string' && announcedName.trim()) {
+                    coordinatorName = announcedName.trim();
+                    console.log(`[Servidor JS] Coordenador anunciado: ${coordinatorName}`);
+                }
+            } else if (topic === REPLICATION_TOPIC && message && typeof message === 'object') {
+                applyReplication(message);
             }
         } catch (error) {
-            console.error('[Servidor JS] Anúncio de coordenador inválido:', error);
+            console.error('[Servidor JS] Mensagem Pub/Sub inválida:', error);
         }
     }
+}
+
+async function synchronizeInitialData() {
+    const directory = await callReference('list');
+
+    if (!directory || directory.status !== 'success' || !Array.isArray(directory.servers)) {
+        console.error('[Servidor JS] Não foi possível consultar os servidores para a sincronização inicial.');
+        return;
+    }
+
+    for (const server of directory.servers) {
+
+        if (!server || typeof server.name !== 'string' || server.name === serverName) {
+            continue;
+        }
+
+        const response = await callPeer(server.name, 'sync');
+
+        if (!response || response.status !== 'success') {
+            continue;
+        }
+
+        const users = mergeLines(USERS_FILE, response.users);
+        const channels = mergeLines(CHANNELS_FILE, response.channels);
+        const messages = mergeLines(MESSAGES_FILE, response.messages);
+        console.log(`[${getTimestamp()}][REPLICAÇÃO] Sincronização inicial com ${server.name}: ${users} login(s), ${channels} canal(is) e ${messages} mensagem(ns) novos`);
+        return;
+    }
+
+    console.error('[Servidor JS] Nenhum servidor respondeu à sincronização inicial.');
 }
 
 async function announceCoordinator(publisher) {
@@ -260,6 +457,9 @@ async function main() {
     const publisher = new zmq.Publisher();
     const subscriber = new zmq.Subscriber();
     serverName = process.env.SERVER_NAME || process.env.HOSTNAME || `server-javascript-${process.pid}`;
+    replicationPrefix = `${serverName}:${Date.now()}:${process.pid}`;
+    migratePublicationEvents();
+
     if (process.env.BROKER_BACKEND) {
         replySocket.connect(process.env.BROKER_BACKEND);
         console.log(`[Servidor JS] Conectado ao broker em ${process.env.BROKER_BACKEND}`);
@@ -270,6 +470,7 @@ async function main() {
     publisher.connect(process.env.PUBSUB_XSUB_ENDPOINT || 'tcp://proxy-pubsub:5557');
     subscriber.connect(process.env.PUBSUB_XPUB_ENDPOINT || 'tcp://proxy-pubsub:5558');
     subscriber.subscribe('servers');
+    subscriber.subscribe(REPLICATION_TOPIC);
     console.log('[Servidor JS] Publisher conectado ao proxy Pub/Sub');
     const peerEndpoint = process.env.PEER_BIND_ENDPOINT || `tcp://*:${PEER_PORT}`;
     await peerSocket.bind(peerEndpoint);
@@ -278,8 +479,8 @@ async function main() {
         console.error('[Servidor JS] Falha no serviço entre servidores:', error);
         process.exitCode = 1;
     });
-    listenForCoordinatorAnnouncements(subscriber).catch((error) => {
-        console.error('[Servidor JS] Falha ao receber anúncios de coordenador:', error);
+    listenForPubSubMessages(subscriber).catch((error) => {
+        console.error('[Servidor JS] Falha ao receber mensagens Pub/Sub:', error);
         process.exitCode = 1;
     });
 
@@ -287,6 +488,8 @@ async function main() {
     if (registration && registration.status === 'success') {
         serverRank = registration.rank;
         console.log(`[Servidor JS] Registrado como ${serverName}, rank ${registration.rank}`);
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await synchronizeInitialData();
         await electCoordinator(publisher);
     }
 
@@ -314,6 +517,11 @@ async function main() {
                         console.log(`[${request.timestamp}][LOGIN ERRO] Nome inválido`);
                     } else {
                         saveUser(username, request.timestamp);
+                        await publishReplication(publisher, {
+                            type: 'login',
+                            username,
+                            login_timestamp: request.timestamp
+                        });
                         response = { status: 'success', message: 'Login realizado com sucesso' };
                         console.log(`[${request.timestamp}][LOGIN] Usuário: ${username}`);
                     }
@@ -328,6 +536,7 @@ async function main() {
                         console.log(`[${request.timestamp}][CANAL ERRO] Já existe: ${channel}`);
                     } else {
                         saveChannel(channel, request.timestamp);
+                        await publishReplication(publisher, { type: 'channel', channel });
                         response = { status: 'success', message: 'Canal criado com sucesso' };
                         console.log(`[${request.timestamp}][CHANNEL] Canal criado: ${channel}`);
                     }
@@ -354,6 +563,7 @@ async function main() {
                             message,
                             timestamp: getTimestamp()
                         };
+                        saveMessage(channel, username, message, request.timestamp, publication.timestamp);
                         logicalClock += 1;
                         publication.logical_clock = logicalClock;
                         if (username) {
@@ -363,6 +573,14 @@ async function main() {
                         await publisher.send([Buffer.from(channel), msgpack.encode(publication)]);
                         response = { status: 'success', message: 'Publicação enviada' };
                         console.log(`[${publication.timestamp}][PUB] ${objectToString(publication)}`);
+                        await publishReplication(publisher, {
+                            type: 'publication',
+                            channel,
+                            username,
+                            message,
+                            request_timestamp: request.timestamp,
+                            publication_timestamp: publication.timestamp
+                        });
                     }
                 } else {
                     response = { status: 'error', message: 'Ação desconhecida' };
