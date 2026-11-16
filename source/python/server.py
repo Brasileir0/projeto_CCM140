@@ -18,24 +18,34 @@ REFERENCE_TIMEOUT_MS = int(os.environ.get("REFERENCE_TIMEOUT_MS", "2000"))
 PEER_BIND_ENDPOINT = os.environ.get("PEER_BIND_ENDPOINT", "tcp://*:5560")
 PEER_PORT = os.environ.get("PEER_PORT", "5560")
 PEER_TIMEOUT_MS = int(os.environ.get("PEER_TIMEOUT_MS", "1000"))
-
 PEER_ENDPOINTS = dict(
     item.split("=", 1) for item in os.environ.get("PEER_ENDPOINTS", "").split(",") if "=" in item
 )
 
 SERVERS_TOPIC = "servers"
 PUBSUB_XPUB_ENDPOINT = os.environ.get("PUBSUB_XPUB_ENDPOINT", "tcp://proxy-pubsub:5558")
+
+REPLICATION_TOPIC = "replication"
+REPLICATION_FILE = DATA_DIR / "replication.jsonl"
+RECORD_TYPES = ("login", "channel", "publication")
+SYNC_BATCH_SIZE = 500
+SYNC_TIMEOUT_MS = int(os.environ.get("SYNC_TIMEOUT_MS", "3000"))
+REPLICATION_SYNC_INTERVAL = int(os.environ.get("REPLICATION_SYNC_INTERVAL", "30"))
+
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "10"))
 CLOCK_SYNC_INTERVAL = int(os.environ.get("CLOCK_SYNC_INTERVAL", "15"))
+
 logical_clock = 0
 clock_offset = timedelta(milliseconds=float(os.environ.get("CLOCK_OFFSET_MS", "0")))
 my_rank: int | None = None
 coordinator: str | None = None
 
+replication_log: list[dict] = []
+last_seq: dict[str, int] = {}
+sync_cursor = 0
 
 def get_now() -> datetime:
     return datetime.now(timezone.utc) + clock_offset
-
 
 def get_timestamp() -> str:
     return get_now().astimezone().isoformat()
@@ -52,7 +62,11 @@ def observe_logical_clock(value: object) -> None:
 
 
 def dict_to_string(values: dict) -> str:
-    return "{ " + " | ".join(f"{key}: {values[key]}" for key in sorted(values)) + " }"
+    def show(value: object) -> object:
+        if isinstance(value, list) and len(value) > 5:
+            return f"[{len(value)} itens]"
+        return value
+    return "{ " + " | ".join(f"{key}: {show(values[key])}" for key in sorted(values)) + " }"
 
 def load_channels() -> set[str]:
     if not CHANNELS_FILE.exists():
@@ -170,9 +184,11 @@ def peer_endpoint(name: str) -> str:
     return PEER_ENDPOINTS.get(name) or f"tcp://{name}:{PEER_PORT}"
 
 
-def call_peer(context: zmq.Context, name: str, action: str) -> tuple[dict, datetime, datetime] | None:
-    request = {"action": action, "name": SERVER_NAME, "rank": str(my_rank)}
-    return send_request(context, peer_endpoint(name), request, "PEER", PEER_TIMEOUT_MS)
+def call_peer(
+    context: zmq.Context, name: str, action: str, timeout_ms: int = PEER_TIMEOUT_MS, extra: dict | None = None
+) -> tuple[dict, datetime, datetime] | None:
+    request = {"action": action, "name": SERVER_NAME, "rank": str(my_rank), **(extra or {})}
+    return send_request(context, peer_endpoint(name), request, "PEER", timeout_ms)
 
 def announce_coordinator(publisher: zmq.Socket) -> None:
     announcement = {
@@ -287,6 +303,19 @@ def handle_peer_request(raw_request: bytes, peer_socket: zmq.Socket) -> bool:
             except (TypeError, ValueError):
                 sender_rank = None
             start_election = my_rank is not None and sender_rank is not None and sender_rank < my_rank
+        elif action == "sync":
+            known = request.get("known") if isinstance(request.get("known"), dict) else {}
+            missing = [
+                record for record in replication_log
+                if record["seq"] > to_int(known.get(record["origin"]), 0)
+            ]
+            missing.sort(key=lambda record: (record["origin"], record["seq"]))
+            batch = missing[:SYNC_BATCH_SIZE]
+            response = {
+                "status": "success",
+                "records": batch,
+                "more": "true" if len(missing) > len(batch) else "false",
+            }
         else:
             response = {"status": "error", "message": "Ação desconhecida"}
 
@@ -295,6 +324,160 @@ def handle_peer_request(raw_request: bytes, peer_socket: zmq.Socket) -> bool:
     print(f"[{response['timestamp']}][PEER-ENVIADO] {dict_to_string(response)}", flush=True)
     peer_socket.send(msgpack.packb(response, use_bin_type=True))
     return start_election
+
+def to_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def load_replication_log() -> None:
+    if not REPLICATION_FILE.exists():
+        return
+    for line in REPLICATION_FILE.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get("origin"), str) and isinstance(record.get("seq"), int):
+            replication_log.append(record)
+            last_seq[record["origin"]] = max(last_seq.get(record["origin"], 0), record["seq"])
+    print(f"[{get_timestamp()}][REPL] Log carregado: {len(replication_log)} registros", flush=True)
+
+
+def is_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def is_valid_record(record: object) -> bool:
+    if not isinstance(record, dict) or not is_text(record.get("origin")):
+        return False
+    seq = record.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+        return False
+    kind = record.get("type")
+    if kind == "login":
+        return is_text(record.get("username")) and isinstance(record.get("request_timestamp"), str)
+    if kind == "channel":
+        return is_text(record.get("channel"))
+    if kind == "publication":
+        return (
+            is_text(record.get("channel"))
+            and is_text(record.get("message"))
+            and isinstance(record.get("publication_timestamp"), str)
+        )
+    return False
+
+def apply_record(record: dict) -> None:
+    if record["type"] == "login":
+        with USERS_FILE.open("a", encoding="utf-8") as users:
+            users.write(f"{record['username']},{record['request_timestamp']}\n")
+    elif record["type"] == "channel":
+        if record["channel"] not in load_channels():
+            with CHANNELS_FILE.open("a", encoding="utf-8") as channel_file:
+                channel_file.write(f"{record['channel']}\n")
+    elif record["type"] == "publication":
+        event = {
+            "type": "publication",
+            "channel": record["channel"],
+            "message": record["message"],
+            "timestamp": record["publication_timestamp"],
+        }
+        for key in ("publication_clock", "username", "request_timestamp"):
+            if key in record:
+                event["logical_clock" if key == "publication_clock" else key] = record[key]
+        event["origin"] = record["origin"]
+        persist_event(event)
+
+def store_record(record: dict) -> None:
+    with REPLICATION_FILE.open("a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    replication_log.append(record)
+    last_seq[record["origin"]] = record["seq"]
+    apply_record(record)
+
+def commit_record(data: dict, publisher: zmq.Socket) -> None:
+    record = {"origin": SERVER_NAME, "seq": last_seq.get(SERVER_NAME, 0) + 1, **data}
+    record["logical_clock"] = tick()
+    record["timestamp"] = get_timestamp()
+    store_record(record)
+    publisher.send_multipart([
+        REPLICATION_TOPIC.encode("utf-8"),
+        msgpack.packb(record, use_bin_type=True),
+    ])
+    print(f"[{record['timestamp']}][REPL-PUB] {record['type']} {record['origin']}#{record['seq']}", flush=True)
+
+def accept_record(record: object) -> str:
+    if not is_valid_record(record):
+        return "invalid"
+    last = last_seq.get(record["origin"], 0)
+    if record["seq"] <= last:
+        return "duplicate"
+    if record["seq"] > last + 1:
+        return "gap"
+    observe_logical_clock(record.get("logical_clock"))
+    store_record(record)
+    print(f"[{get_timestamp()}][REPL] Aplicado {record['type']} {record['origin']}#{record['seq']}", flush=True)
+    return "applied"
+
+def pull_from(context: zmq.Context, peer_name: str) -> int:
+    total = 0
+    while True:
+        result = call_peer(context, peer_name, "sync", SYNC_TIMEOUT_MS, {"known": dict(last_seq)})
+        if result is None or result[0].get("status") != "success":
+            break
+        response = result[0]
+        applied = 0
+        if isinstance(response.get("records"), list):
+            for record in response["records"]:
+                if accept_record(record) == "applied":
+                    applied += 1
+        total += applied
+        if applied == 0 or str(response.get("more")).lower() != "true":
+            break
+    return total
+
+def other_servers(context: zmq.Context) -> list[str]:
+    return sorted(name for name, _ in fetch_servers(context) if name != SERVER_NAME)
+
+def startup_sync(context: zmq.Context) -> None:
+    for name in other_servers(context):
+        pulled = pull_from(context, name)
+        print(f"[{get_timestamp()}][REPL] Sincronização inicial com {name}: {pulled} registros novos", flush=True)
+
+def periodic_sync(context: zmq.Context) -> None:
+    global sync_cursor
+    peers = other_servers(context)
+    if not peers:
+        return
+    name = peers[sync_cursor % len(peers)]
+    sync_cursor += 1
+    pulled = pull_from(context, name)
+    if pulled:
+        print(f"[{get_timestamp()}][REPL] Sincronização com {name}: {pulled} registros que faltavam", flush=True)
+
+def handle_replication(frames: list[bytes], context: zmq.Context) -> None:
+    try:
+        record = msgpack.unpackb(frames[1], raw=False)
+    except Exception as error:
+        print(f"[{get_timestamp()}][REPL-ERRO] Registro inválido: {error}", flush=True)
+        return
+    if isinstance(record, dict) and record.get("origin") == SERVER_NAME:
+        return
+    result = accept_record(record)
+    if result == "gap":
+        origin = record["origin"]
+        print(f"[{get_timestamp()}][REPL] Faltam registros de {origin} antes de #{record['seq']}; sincronizando", flush=True)
+        pull_from(context, origin)
+    elif result == "invalid":
+        print(f"[{get_timestamp()}][REPL-ERRO] Registro com formato inválido", flush=True)
+
+def handle_subscription(frames: list[bytes], context: zmq.Context) -> bool:
+    if len(frames) == 2 and frames[0].decode("utf-8", errors="replace") == REPLICATION_TOPIC:
+        handle_replication(frames, context)
+        return False
+    return handle_announcement(frames)
 
 def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[str, object]:
     action = request.get("action")
@@ -311,8 +494,7 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
 
         username = username.strip()
 
-        with USERS_FILE.open("a", encoding="utf-8") as users:
-            users.write(f"{username},{timestamp}\n")
+        commit_record({"type": "login", "username": username, "request_timestamp": timestamp}, publisher)
 
         print(f"[{timestamp}][LOGIN] Usuário: {username}", flush=True)
         return {"status": "success", "message": "Login realizado com sucesso"}
@@ -331,8 +513,7 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
             print(f"[{timestamp}][CANAL ERRO] Canal já existe: {channel}", flush=True)
             return {"status": "error", "message": "Canal já existe"}
 
-        with CHANNELS_FILE.open("a", encoding="utf-8") as channel_file:
-            channel_file.write(f"{channel}\n")
+        commit_record({"type": "channel", "channel": channel}, publisher)
 
         print(f"[{timestamp}][CHANNEL] Canal criado: {channel}", flush=True)
         return {"status": "success", "message": "Canal criado com sucesso"}
@@ -363,10 +544,8 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
 
         channel = channel.strip()
         channels = load_channels()
-
         if channel not in channels:
-            with CHANNELS_FILE.open("a", encoding="utf-8") as channel_file:
-                channel_file.write(f"{channel}\n")
+            commit_record({"type": "channel", "channel": channel}, publisher)
             print(f"[{timestamp}][CHANNEL] Canal registrado a partir de publicação: {channel}", flush=True)
 
         publication = {
@@ -377,12 +556,17 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
         publication["logical_clock"] = tick()
         if isinstance(username, str) and username.strip():
             publication["username"] = username.strip()
-
-        persist_event({
+        publication_record = {
             "type": "publication",
-            **publication,
-            "request_timestamp": timestamp
-        })
+            "channel": channel,
+            "message": message,
+            "publication_timestamp": publication["timestamp"],
+            "publication_clock": publication["logical_clock"],
+            "request_timestamp": timestamp,
+        }
+        if "username" in publication:
+            publication_record["username"] = publication["username"]
+        commit_record(publication_record, publisher)
 
         publisher.send_multipart([
             channel.encode("utf-8"),
@@ -435,6 +619,7 @@ def handle_client_message(raw_request: bytes, socket: zmq.Socket, publisher: zmq
 
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    load_replication_log()
     context = zmq.Context()
     socket = context.socket(zmq.REP)
     broker_backend = os.environ.get("BROKER_BACKEND")
@@ -454,7 +639,12 @@ def main() -> None:
     subscriber = context.socket(zmq.SUB)
     subscriber.connect(PUBSUB_XPUB_ENDPOINT)
     subscriber.setsockopt_string(zmq.SUBSCRIBE, SERVERS_TOPIC)
-    print(f"[Servidor Python] Escutando servidores em {PEER_BIND_ENDPOINT} e o tópico '{SERVERS_TOPIC}'", flush=True)
+    subscriber.setsockopt_string(zmq.SUBSCRIBE, REPLICATION_TOPIC)
+    print(
+        f"[Servidor Python] Escutando servidores em {PEER_BIND_ENDPOINT} e os tópicos "
+        f"'{SERVERS_TOPIC}' e '{REPLICATION_TOPIC}'",
+        flush=True,
+    )
 
     if REFERENCE_ENDPOINT:
         print(f"[Servidor Python] {SERVER_NAME} usando a referência em {REFERENCE_ENDPOINT}", flush=True)
@@ -466,13 +656,14 @@ def main() -> None:
             )
         if request_rank(context) is not None:
             run_election(context, publisher)
-
+        startup_sync(context)
     poller = zmq.Poller()
     poller.register(socket, zmq.POLLIN)
     poller.register(peer_socket, zmq.POLLIN)
     poller.register(subscriber, zmq.POLLIN)
 
     client_messages = 0
+    next_sync = time.monotonic() + REPLICATION_SYNC_INTERVAL
     try:
         while True:
             events = dict(poller.poll(500))
@@ -482,15 +673,20 @@ def main() -> None:
                 start_election = handle_peer_request(peer_socket.recv(), peer_socket) or start_election
 
             if subscriber in events:
-                start_election = handle_announcement(subscriber.recv_multipart()) or start_election
+                start_election = handle_subscription(subscriber.recv_multipart(), context) or start_election
 
             if socket in events:
                 client_messages += 1
                 handle_client_message(socket.recv(), socket, publisher)
+
                 if REFERENCE_ENDPOINT and client_messages % HEARTBEAT_INTERVAL == 0:
                     send_heartbeat(context)
                 if REFERENCE_ENDPOINT and client_messages % CLOCK_SYNC_INTERVAL == 0:
                     synchronize_with_coordinator(context, publisher)
+            if REFERENCE_ENDPOINT and time.monotonic() >= next_sync:
+                periodic_sync(context)
+                next_sync = time.monotonic() + REPLICATION_SYNC_INTERVAL
+
             if start_election:
                 run_election(context, publisher)
     finally:
