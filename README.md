@@ -285,13 +285,19 @@ O Pub/Sub do ZeroMQ não guarda mensagens: um servidor que estava parado (ou que
 Ao iniciar, depois de pedir o rank, o servidor pede a lista de servidores à referência e manda `sync` para os outros, um de cada vez, até que um responda. Das linhas recebidas, ele grava só as que ainda não tem e mostra `[REPLICAÇÃO] Sincronização inicial com <servidor>: N login(s), M canal(is) e K mensagem(ns) novos`. A partir daí, o tópico `replication` mantém os dados atualizados.
 
 Outras adaptações:
-- o servidor C++ guarda em memória as linhas de cada arquivo, para conferir duplicatas sem reler o disco, e protege esses dados com um mutex, porque a thread da porta 5560 os lê para responder o `sync`;
+- o servidor C++ guarda em memória as linhas de cada arquivo, para conferir duplicatas sem reler o disco, e protege esses dados com um mutex, porque a thread da porta 5560 os lê para responder o `sync`. No log, a resposta do `sync` mostra só a quantidade de linhas enviadas;
 - o servidor JavaScript passou a gravar `users.txt`, `channels.txt` e `messages.txt` no mesmo formato do C++, para que o `sync` dos dois seja compatível.
 
 ### Situação entre as linguagens
 
-- **C++ e JavaScript** usam o mesmo protocolo (`id`, `login_timestamp` e o `sync` com `users`/`channels`/`messages`) e trocam todos os dados entre si e com o Python.
-- **Python** usa uma variação: um log de registros (`replication.jsonl`) numerado por `seq` para cada `origin`, com `request_timestamp` no login. Ele detecta registros faltando pela sequência e, nesse caso, pede ao `origin` os registros que faltam (`sync` com `known` e resposta `records`). Também faz uma sincronização periódica a cada 30 segundos. C++ e JavaScript aplicam as publicações e os canais vindos do Python (o C++ também aceita o login do Python, lendo a hora em `request_timestamp`). Mas **o Python ainda rejeita os registros do C++ e do JavaScript** (`[REPL-ERRO] Registro com formato inválido`), porque eles não têm o campo `seq`. O JavaScript, por sua vez, não aceita os logins do Python, porque eles não têm `login_timestamp`. Para fechar a replicação completa, falta unificar esse formato.
+- **C++ e JavaScript** usam o mesmo protocolo (`id`, `login_timestamp` e o `sync` com `users`/`channels`/`messages`). O C++ também aceita a hora do login em `request_timestamp`.
+- **Python** usa uma variação entre os servidores Python: um log de registros (`replication.jsonl`) numerado por `seq` para cada `origin`. Ele detecta registros faltando pela sequência e, nesse caso, pede ao `origin` os registros que faltam (`sync` com `known` e resposta `records`). Também faz uma sincronização periódica com um servidor diferente a cada 30 segundos.
+- **Compatibilidade entre os dois formatos:**
+  - o Python aceita os registros do C++ e do JavaScript, que vêm sem `seq`, usando o `id` para não aplicar o mesmo registro duas vezes (`[REPL] Aplicado <tipo> de <origem> (<id>, gravado)`);
+  - os logins do Python levam também `login_timestamp`, para o C++ e o JavaScript aceitarem;
+  - quando recebe `sync` sem `known` (pedido do C++ ou do JS), o Python responde com `users`, `channels` e `messages` em linhas de texto, como os outros;
+  - quando o Python pede `sync` a um servidor C++ ou JS, grava só as linhas que ainda não tem (`[REPL] Dados de <servidor>: ...`);
+  - o Python guarda em memória os logins e as publicações já gravados, para não gravá-los de novo.
 
 ### Como verificar
 
@@ -301,9 +307,12 @@ Com os containers rodando, num segundo terminal (em `source/`):
 # registros enviados e recebidos pelos servidores C++
 docker compose logs server-cpp-1 server-cpp-2 | grep REPLICAÇÃO | tail -20
 
-# os dois servidores C++ devem ter o mesmo número de mensagens
+# registros do C++ e do JS aplicados pelo Python (não deve aparecer REPL-ERRO)
+docker compose logs server-python-1 | grep -E "REPL" | tail -20
+
+# os servidores C++ e JS devem ter o mesmo número de mensagens
 docker compose exec server-cpp-1 wc -l data/messages.txt
-docker compose exec server-cpp-2 wc -l data/messages.txt
+docker compose exec server-javascript-1 wc -l data/messages.txt
 
 # sincronização inicial: pare um servidor, espere uns 20 segundos e religue
 docker compose stop server-cpp-2

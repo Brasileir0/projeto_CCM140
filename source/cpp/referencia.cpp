@@ -12,13 +12,6 @@
 #include <zmq.hpp>
 #include <msgpack.hpp>
 
-// Serviço de referência (compatível com o reference.js): só conversa com os servidores.
-// - rank: devolve o rank do servidor (o mesmo nome recebe sempre o mesmo rank)
-// - heartbeat: mantém o servidor na lista e responde só OK ("Servidor não registrado" se
-//   ele não pediu rank). Desde a parte 4 a hora correta vem do coordenador, então o
-//   heartbeat não responde mais com a hora.
-// - list: devolve os servidores disponíveis como lista de { name, rank }
-// Toda resposta leva o timestamp de envio e o logical_clock, como qualquer mensagem.
 
 struct ServerInfo {
     long long rank;
@@ -31,7 +24,6 @@ long long next_rank = 1;
 long long logical_clock = 0;
 long long heartbeat_timeout_ms = 30000;
 
-// Horário local, usado só nos logs.
 std::string get_log_timestamp() {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
@@ -42,7 +34,6 @@ std::string get_log_timestamp() {
     return ss.str();
 }
 
-// Timestamp de envio das respostas: "AAAA-MM-DDTHH:MM:SS.mmmZ".
 std::string get_iso_timestamp() {
     const auto now = std::chrono::system_clock::now();
     const auto milliseconds =
@@ -107,7 +98,6 @@ std::map<std::string, std::string> decode_message(const char* data, std::size_t 
     return fields;
 }
 
-// Relógio lógico: ao receber, fica com o maior valor entre o local e o recebido.
 void update_clock(const std::map<std::string, std::string>& message) {
     const auto clock = message.find("logical_clock");
     if (clock == message.end()) return;
@@ -117,7 +107,6 @@ void update_clock(const std::map<std::string, std::string>& message) {
     }
 }
 
-// Resposta da referência. rank e servers só são enviados quando preenchidos.
 struct Response {
     std::string status;
     std::string message;
@@ -254,7 +243,6 @@ int main() {
               << " (timeout de heartbeat: " << heartbeat_timeout_ms / 1000 << "s)" << std::endl;
 
     while (true) {
-        // Timeout para conseguir remover servidores mesmo sem receber mensagens.
         zmq::pollitem_t items[] = {{socket.handle(), 0, ZMQ_POLLIN, 0}};
         zmq::poll(items, 1, std::chrono::milliseconds(1000));
         remove_expired_servers();

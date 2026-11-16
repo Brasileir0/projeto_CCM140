@@ -21,13 +21,8 @@
 #include <msgpack.hpp>
 #include <map>
 
-// Relógio lógico (Lamport) do servidor. A thread principal e a thread que atende
-// os outros servidores mexem nele, então fica protegido por mutex.
 std::mutex clock_mutex;
 long long logical_clock = 0;
-// Diferença, em ms, entre o relógio físico do servidor e o do sistema.
-// Começa com CLOCK_OFFSET_MS (atraso simulado) e é corrigida pela sincronização
-// com o coordenador (algoritmo de Berkeley).
 std::atomic<long long> clock_offset_ms(0);
 
 std::string server_name;
@@ -38,14 +33,11 @@ int client_messages = 0;
 const int HEARTBEAT_INTERVAL = 10;
 const int CLOCK_SYNC_INTERVAL = 15;
 
-// Estado da eleição. "coordinator" é o nome do servidor eleito como coordenador.
 std::mutex state_mutex;
 std::string coordinator;
 std::atomic<bool> election_requested(false);
-// Servidores disponíveis segundo a referência: nome e rank.
 std::vector<std::pair<std::string, int>> known_servers;
 
-// As duas threads escrevem na tela; o mutex evita que as linhas se misturem.
 std::mutex output_mutex;
 
 template <typename... Args>
@@ -81,8 +73,6 @@ std::string get_timestamp() {
     return ss.str();
 }
 
-// Hora em ms -> "AAAA-MM-DDTHH:MM:SS.mmmZ" (UTC). É o formato que Python e JS usam
-// para trocar a hora correta com o coordenador.
 std::string iso_timestamp(long long milliseconds) {
     std::time_t in_time_t = static_cast<std::time_t>(milliseconds / 1000);
     std::tm utc_time{};
@@ -93,7 +83,6 @@ std::string iso_timestamp(long long milliseconds) {
     return ss.str();
 }
 
-// "AAAA-MM-DDTHH:MM:SS(.fff)" (com T ou espaço; considerado UTC) -> ms desde a época.
 bool parse_timestamp_ms(const std::string& timestamp, long long& milliseconds) {
     std::tm time{};
     double seconds = 0;
@@ -108,8 +97,6 @@ bool parse_timestamp_ms(const std::string& timestamp, long long& milliseconds) {
     return true;
 }
 
-// Hora informada numa mensagem de relógio: o campo "time" (ms) se existir;
-// senão, o "timestamp" (como mandam os servidores Python e JS).
 bool message_time_ms(const std::map<std::string, std::string>& fields, long long& milliseconds) {
     const auto time = fields.find("time");
     if (time != fields.end() && !time->second.empty()) {
@@ -151,9 +138,6 @@ std::string map_to_string(const std::map<std::string, std::string>& values) {
     return output + " }";
 }
 
-// As mensagens podem trazer valores de outros tipos além de texto (por exemplo,
-// logical_clock é um número e a lista de servidores é um array), então cada valor
-// é convertido para texto antes de ser usado.
 std::string value_to_string(const msgpack::object& value) {
     switch (value.type) {
         case msgpack::type::STR:
@@ -178,7 +162,6 @@ std::string value_to_string(const msgpack::object& value) {
             return output;
         }
         case msgpack::type::MAP: {
-            // Item da lista de servidores: { name, rank } vira "nome:rank".
             std::map<std::string, std::string> fields;
             for (uint32_t i = 0; i < value.via.map.size; ++i) {
                 fields[value_to_string(value.via.map.ptr[i].key)] = value_to_string(value.via.map.ptr[i].val);
@@ -206,7 +189,6 @@ std::map<std::string, std::string> decode_message(const char* data, std::size_t 
     return fields;
 }
 
-// Empacota os campos de texto e o logical_clock como número inteiro.
 msgpack::sbuffer encode_message(std::map<std::string, std::string> fields, long long clock) {
     fields.erase("logical_clock");
     msgpack::sbuffer buffer;
@@ -221,13 +203,11 @@ msgpack::sbuffer encode_message(std::map<std::string, std::string> fields, long 
     return buffer;
 }
 
-// Incrementa o relógio lógico antes de enviar uma mensagem.
 long long tick() {
     std::lock_guard<std::mutex> lock(clock_mutex);
     return ++logical_clock;
 }
 
-// Ao receber, fica com o maior valor entre o local e o recebido.
 void update_clock(const std::map<std::string, std::string>& message) {
     const auto clock = message.find("logical_clock");
     if (clock == message.end()) return;
@@ -245,18 +225,11 @@ void send_message(zmq::socket_t& socket, const std::map<std::string, std::string
     socket.send(message, zmq::send_flags::none);
 }
 
-// ---------------------------------------------------------------------------
-// Persistência
-// ---------------------------------------------------------------------------
-// Com a replicação, o mesmo dado pode chegar mais de uma vez (pelo tópico
-// "replication" e pela sincronização inicial), então cada arquivo só recebe
-// linhas que ainda não tem. A thread que atende os outros servidores também lê
-// esses arquivos, por isso o acesso é protegido por mutex.
 const char* USERS_FILE = "data/users.txt";
 const char* CHANNELS_FILE = "data/channels.txt";
 const char* MESSAGES_FILE = "data/messages.txt";
 std::mutex data_mutex;
-std::map<std::string, std::set<std::string>> stored_lines;  // arquivo -> linhas já gravadas
+std::map<std::string, std::set<std::string>> stored_lines;
 
 std::vector<std::string> read_lines(const std::string& path) {
     std::vector<std::string> lines;
@@ -277,7 +250,6 @@ void load_stored_lines() {
     }
 }
 
-// Grava a linha no arquivo se ela ainda não existir. Devolve true se gravou.
 bool append_line(const char* path, const std::string& line) {
     std::lock_guard<std::mutex> lock(data_mutex);
     if (!stored_lines[path].insert(line).second) {
@@ -315,7 +287,6 @@ std::set<std::string> load_channels() {
     return stored_lines[CHANNELS_FILE];
 }
 
-// Todas as linhas de um arquivo, separadas por quebra de linha (usado na sincronização inicial).
 std::string dump_lines(const char* path) {
     std::lock_guard<std::mutex> lock(data_mutex);
     std::string output;
@@ -325,7 +296,6 @@ std::string dump_lines(const char* path) {
     return output;
 }
 
-// Grava as linhas recebidas (separadas por quebra de linha) e devolve quantas eram novas.
 int merge_lines(const char* path, const std::string& lines) {
     int added = 0;
     std::stringstream stream(lines);
@@ -336,17 +306,10 @@ int merge_lines(const char* path, const std::string& lines) {
     return added;
 }
 
-// ---------------------------------------------------------------------------
-// Replicação (parte 5)
-// ---------------------------------------------------------------------------
-// Replicação ativa pelo Pub/Sub: toda gravação feita a partir de um cliente
-// (login, criação de canal ou publicação) é publicada no tópico "replication".
-// Todos os servidores assinam o tópico e gravam o mesmo dado no próprio disco,
-// então todos acabam com todos os dados.
 const std::string REPLICATION_TOPIC = "replication";
-std::string replication_prefix;  // nome do servidor + horário de início (ids não se repetem após reiniciar)
+std::string replication_prefix;
 long long replication_sequence = 0;
-std::set<std::string> applied_replications;  // ids já aplicados (só a thread principal usa)
+std::set<std::string> applied_replications;
 
 void publish_replication(zmq::socket_t& pub_socket, std::map<std::string, std::string> fields) {
     fields["origin"] = server_name;
@@ -368,14 +331,12 @@ void apply_replication(const std::map<std::string, std::string>& fields) {
     };
     const std::string origin = get("origin");
     const std::string id = get("id");
-    // O próprio servidor também recebe o que publicou; isso já está gravado.
     if (origin == server_name) return;
     if (!id.empty() && !applied_replications.insert(id).second) return;
 
     const std::string type = get("type");
     bool stored = false;
     if (type == "login") {
-        // O Python manda a hora do login em request_timestamp.
         const std::string login_timestamp =
             get("login_timestamp").empty() ? get("request_timestamp") : get("login_timestamp");
         stored = save_user(get("username"), login_timestamp);
@@ -393,7 +354,6 @@ void apply_replication(const std::map<std::string, std::string>& fields) {
              stored ? "gravado" : "já existia", "): ", map_to_string(fields));
 }
 
-// "nome:rank;nome:rank" -> lista de (nome, rank).
 std::vector<std::pair<std::string, int>> parse_servers(const std::string& value) {
     std::vector<std::pair<std::string, int>> servers;
     std::stringstream stream(value);
@@ -409,12 +369,7 @@ std::vector<std::pair<std::string, int>> parse_servers(const std::string& value)
     return servers;
 }
 
-// ---------------------------------------------------------------------------
-// Serviço de referência (rank, heartbeat e lista de servidores)
-// ---------------------------------------------------------------------------
 
-// Socket REQ para o serviço de referência. Se a referência não responder dentro
-// do timeout, o socket é recriado (um REQ sem resposta fica travado).
 std::unique_ptr<zmq::socket_t> reference_socket;
 
 void connect_reference(zmq::context_t& context) {
@@ -465,7 +420,6 @@ void request_rank(zmq::context_t& context) {
     }
 }
 
-// Atualiza a lista de servidores disponíveis pela referência.
 void request_server_list(zmq::context_t& context) {
     std::map<std::string, std::string> response;
     if (reference_request(context, {{"action", "list"}}, response)) {
@@ -474,12 +428,9 @@ void request_server_list(zmq::context_t& context) {
     }
 }
 
-// Heartbeat: mantém o servidor na lista da referência. A partir da parte 4 a hora
-// correta vem do coordenador, então a resposta do heartbeat não é usada para o relógio.
 void send_heartbeat(zmq::context_t& context) {
     std::map<std::string, std::string> response;
     if (!reference_request(context, {{"action", "heartbeat"}}, response)) {
-        // A referência pode ter esquecido o servidor (por exemplo, se reiniciou).
         if (response["message"] == "Servidor não registrado") {
             request_rank(context);
         }
@@ -487,7 +438,6 @@ void send_heartbeat(zmq::context_t& context) {
     }
     request_server_list(context);
 
-    // Se o coordenador saiu da lista da referência, é preciso eleger outro.
     const std::string current = get_coordinator();
     if (!current.empty() &&
         std::none_of(known_servers.begin(), known_servers.end(),
@@ -498,21 +448,13 @@ void send_heartbeat(zmq::context_t& context) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Comunicação entre servidores (eleição e relógio)
-// ---------------------------------------------------------------------------
 
-// Diferenças de relógio (em ms) informadas pelos servidores ao coordenador,
-// usadas no algoritmo de Berkeley. Só a thread dos servidores mexe nisso.
 struct ClockReport {
     long long difference_ms;
     std::chrono::steady_clock::time_point received_at;
 };
 std::map<std::string, ClockReport> clock_reports;
 
-// Algoritmo de Berkeley no coordenador: a hora correta é a média dos relógios
-// conhecidos (o do coordenador e os informados pelos servidores nos últimos 60 s).
-// O coordenador também ajusta o próprio relógio para essa média.
 long long berkeley_correct_time(const std::string& requester, long long requester_time) {
     const long long coordinator_time = now_ms();
     const auto now = std::chrono::steady_clock::now();
@@ -526,14 +468,12 @@ long long berkeley_correct_time(const std::string& requester, long long requeste
         }
     }
 
-    long long sum = 0;  // a diferença do próprio coordenador é 0
+    long long sum = 0;
     for (const auto& [name, report] : clock_reports) {
         sum += report.difference_ms;
     }
     const long long average = sum / static_cast<long long>(clock_reports.size() + 1);
 
-    // O coordenador anda "average" ms; as diferenças guardadas passam a ser relativas
-    // ao novo relógio. Quem pediu vai acertar o relógio para a hora correta (diferença 0).
     clock_offset_ms += average;
     for (auto& [name, report] : clock_reports) {
         report.difference_ms -= average;
@@ -545,8 +485,6 @@ long long berkeley_correct_time(const std::string& requester, long long requeste
     return coordinator_time + average;
 }
 
-// Thread que atende os pedidos de outros servidores (eleição e relógio) num socket REP
-// próprio, para não depender da thread principal, que pode estar esperando outro servidor.
 void peer_loop(zmq::context_t& context) {
     zmq::socket_t socket(context, zmq::socket_type::rep);
     socket.bind("tcp://*:" + std::to_string(peer_port));
@@ -567,7 +505,6 @@ void peer_loop(zmq::context_t& context) {
             const std::string action = fields["action"];
 
             if (action == "election") {
-                // Quem recebe o pedido responde OK e começa a sua própria eleição.
                 reply["status"] = "success";
                 reply["message"] = "OK";
                 election_requested = true;
@@ -580,7 +517,6 @@ void peer_loop(zmq::context_t& context) {
                     reply["message"] = "Não sou o coordenador";
                     reply["coordinator"] = current;
                 } else {
-                    // Sem hora válida no pedido, o relógio de quem pediu entra na média como igual ao do coordenador.
                     long long requester_time = 0;
                     if (!message_time_ms(fields, requester_time)) {
                         requester_time = now_ms();
@@ -589,12 +525,10 @@ void peer_loop(zmq::context_t& context) {
                     reply["status"] = "success";
                     reply["message"] = "Hora correta";
                     reply["time"] = std::to_string(correct_time);
-                    // Python e JS leem a hora correta do timestamp, em ISO com milissegundos.
                     reply["timestamp"] = iso_timestamp(correct_time);
                     reply["coordinator"] = server_name;
                 }
             } else if (action == "sync") {
-                // Sincronização inicial (parte 5): devolve todos os dados deste servidor.
                 reply["status"] = "success";
                 reply["users"] = dump_lines(USERS_FILE);
                 reply["channels"] = dump_lines(CHANNELS_FILE);
@@ -614,7 +548,18 @@ void peer_loop(zmq::context_t& context) {
             reply["timestamp"] = get_timestamp();
         }
         const long long clock = tick();
-        log_line("[", get_timestamp(), "][ENVIADO SERVIDOR] ", map_to_string(reply), " | logical_clock: ", clock);
+        std::map<std::string, std::string> shown = reply;
+        for (const char* key : {"users", "channels", "messages"}) {
+            const auto it = shown.find(key);
+            if (it == shown.end()) continue;
+            std::size_t lines = 0;
+            std::istringstream stream(it->second);
+            for (std::string line; std::getline(stream, line);) {
+                if (!line.empty()) lines++;
+            }
+            it->second = std::to_string(lines) + " linha(s)";
+        }
+        log_line("[", get_timestamp(), "][ENVIADO SERVIDOR] ", map_to_string(shown), " | logical_clock: ", clock);
         send_message(socket, reply, clock);
     }
 }
@@ -623,7 +568,6 @@ std::string peer_endpoint(const std::string& name) {
     return "tcp://" + name + ":" + std::to_string(peer_port);
 }
 
-// Publica no tópico "servers" que este servidor é o coordenador.
 void announce_coordinator(zmq::socket_t& pub_socket) {
     set_coordinator(server_name);
     std::map<std::string, std::string> announcement = {
@@ -641,10 +585,6 @@ void announce_coordinator(zmq::socket_t& pub_socket) {
              map_to_string(announcement), " | logical_clock: ", clock);
 }
 
-// Algoritmo do valentão (bully): pede eleição a todos os servidores de rank maior.
-// Se nenhum responder OK, este servidor é o novo coordenador; se algum responder,
-// espera o anúncio dele no tópico "servers".
-// Devolve true se algum servidor de rank maior respondeu.
 bool start_election(zmq::context_t& context, zmq::socket_t& pub_socket) {
     request_server_list(context);
     std::vector<std::pair<std::string, int>> higher;
@@ -656,16 +596,14 @@ bool start_election(zmq::context_t& context, zmq::socket_t& pub_socket) {
     log_line("[", get_timestamp(), "][ELEIÇÃO] Iniciando eleição (meu rank: ", my_rank, "); pedindo a ",
              higher.size(), " servidor(es) de rank maior");
 
-    // Os pedidos são enviados a todos de uma vez e as respostas esperadas por até 1 s.
     std::vector<std::unique_ptr<zmq::socket_t>> sockets;
-    std::vector<std::string> targets;  // nome do servidor de cada socket
+    std::vector<std::string> targets;
     for (const auto& [name, rank] : higher) {
         auto socket = std::make_unique<zmq::socket_t>(context, zmq::socket_type::req);
         socket->set(zmq::sockopt::linger, 0);
         try {
             socket->connect(peer_endpoint(name));
         } catch (const zmq::error_t& error) {
-            // Servidor que acabou de cair pode nem ter mais o nome na rede; conta como sem resposta.
             log_error("[", get_timestamp(), "][ELEIÇÃO] Não foi possível conectar a ", name, ": ", error.what());
             continue;
         }
@@ -721,9 +659,6 @@ bool start_election(zmq::context_t& context, zmq::socket_t& pub_socket) {
     return someone_answered;
 }
 
-// Sincronização com o coordenador a cada 15 mensagens: "REQ: relógio" -> "REP: hora correta".
-// O servidor envia a sua hora; o coordenador responde a hora correta (Berkeley) e o
-// servidor acerta o relógio somando metade do tempo de ida e volta.
 void synchronize_with_coordinator(zmq::context_t& context) {
     const std::string current = get_coordinator();
     if (current.empty() || current == server_name) {
@@ -785,9 +720,6 @@ void synchronize_with_coordinator(zmq::context_t& context) {
     }
 }
 
-// Sincronização inicial (parte 5): ao subir, o servidor pede todos os dados a outro
-// servidor disponível, para recuperar o que foi gravado enquanto ele estava fora.
-// Tenta os servidores da lista da referência até um responder.
 void initial_sync(zmq::context_t& context) {
     request_server_list(context);
     for (const auto& [name, rank] : known_servers) {
@@ -831,9 +763,6 @@ void initial_sync(zmq::context_t& context) {
     log_line("[", get_timestamp(), "][REPLICAÇÃO] Nenhum servidor respondeu à sincronização; seguindo com os dados locais");
 }
 
-// ---------------------------------------------------------------------------
-// Requisições dos clientes
-// ---------------------------------------------------------------------------
 
 std::map<std::string, std::string> handle_request(std::map<std::string, std::string>& req_map,
                                                   zmq::socket_t& pub_socket) {
@@ -902,8 +831,6 @@ std::map<std::string, std::string> handle_request(std::map<std::string, std::str
             rep_map["message"] = "Canal ou mensagem inválidos";
             log_line("[", request_timestamp, "][PUB ERRO] Canal ou mensagem inválidos");
         } else {
-            // Com o broker, o canal pode ter sido criado em outro servidor;
-            // ele passa a ser registrado também neste.
             if (channels.find(channel) == channels.end()) {
                 save_channel(channel);
                 log_line("[", request_timestamp, "][CHANNEL] Canal registrado a partir de publicação: ", channel);
@@ -943,14 +870,12 @@ std::map<std::string, std::string> handle_request(std::map<std::string, std::str
     return rep_map;
 }
 
-// Anúncio recebido no tópico "servers": guarda o nome do coordenador.
 void handle_announcement(const std::map<std::string, std::string>& fields) {
     const auto name = fields.find("coordinator");
     if (name == fields.end() || name->second.empty()) return;
     set_coordinator(name->second);
     log_line("[", get_timestamp(), "][COORDENADOR] Novo coordenador: ", name->second, " ", map_to_string(fields));
 
-    // No algoritmo do valentão, um servidor de rank maior assume no lugar de um menor.
     const auto rank = fields.find("rank");
     if (name->second != server_name && rank != fields.end()) {
         try {
@@ -970,7 +895,6 @@ int main() {
     gethostname(hostname, sizeof(hostname) - 1);
     const char* configured_name = std::getenv("SERVER_NAME");
     server_name = configured_name ? configured_name : hostname;
-    // Sem REFERENCE_ENDPOINT o servidor funciona sem o serviço de referência (e sem eleição).
     const char* configured_reference = std::getenv("REFERENCE_ENDPOINT");
     reference_endpoint = configured_reference ? configured_reference : "";
     const char* configured_offset = std::getenv("CLOCK_OFFSET_MS");
@@ -987,8 +911,6 @@ int main() {
     zmq::socket_t pub_socket(context, zmq::socket_type::pub);
     zmq::socket_t sub_socket(context, zmq::socket_type::sub);
 
-    // Com BROKER_BACKEND definido, o servidor conecta no DEALER do broker;
-    // sem ele, atende os clientes diretamente na porta 5555.
     const char* broker_backend = std::getenv("BROKER_BACKEND");
     if (broker_backend) {
         socket.connect(broker_backend);
@@ -1000,11 +922,9 @@ int main() {
 
     const char* pubsub_xsub = std::getenv("PUBSUB_XSUB_ENDPOINT");
     pub_socket.connect(pubsub_xsub ? pubsub_xsub : "tcp://proxy-pubsub:5557");
-    // O servidor também assina o tópico "servers" para saber quem é o coordenador.
     const char* pubsub_xpub = std::getenv("PUBSUB_XPUB_ENDPOINT");
     sub_socket.connect(pubsub_xpub ? pubsub_xpub : "tcp://proxy-pubsub:5558");
     sub_socket.set(zmq::sockopt::subscribe, "servers");
-    // E o tópico "replication", para receber os dados gravados pelos outros servidores.
     sub_socket.set(zmq::sockopt::subscribe, REPLICATION_TOPIC);
     replication_prefix = server_name + ":" + std::to_string(now_ms());
     log_line("[Servidor C++] Publisher conectado ao proxy Pub/Sub e inscrito nos tópicos servers e replication");
@@ -1017,7 +937,6 @@ int main() {
         connect_reference(context);
         request_rank(context);
         std::thread(peer_loop, std::ref(context)).detach();
-        // Dá tempo de a inscrição nos tópicos chegar ao proxy antes da eleição e da sincronização.
         sleep(1);
         initial_sync(context);
         election_requested = true;
@@ -1030,7 +949,6 @@ int main() {
         zmq::pollitem_t items[] = {{socket.handle(), 0, ZMQ_POLLIN, 0}, {sub_socket.handle(), 0, ZMQ_POLLIN, 0}};
         zmq::poll(items, 2, std::chrono::milliseconds(500));
 
-        // Anúncios de coordenador no tópico "servers".
         if (items[1].revents & ZMQ_POLLIN) {
             zmq::message_t topic_frame;
             zmq::message_t content_frame;
@@ -1058,7 +976,6 @@ int main() {
             }
         }
 
-        // Requisições dos clientes.
         if (items[0].revents & ZMQ_POLLIN) {
             zmq::message_t request;
             if (socket.recv(request, zmq::recv_flags::none)) {
@@ -1082,11 +999,9 @@ int main() {
 
                 client_messages++;
                 if (use_reference) {
-                    // A cada 10 mensagens de clientes, avisa a referência que está ativo.
                     if (client_messages % HEARTBEAT_INTERVAL == 0) {
                         send_heartbeat(context);
                     }
-                    // A cada 15 mensagens, sincroniza o relógio com o coordenador.
                     if (client_messages % CLOCK_SYNC_INTERVAL == 0) {
                         synchronize_with_coordinator(context);
                     }
@@ -1098,7 +1013,6 @@ int main() {
             continue;
         }
 
-        // Se um servidor de rank maior respondeu mas o anúncio não chegou, tenta de novo.
         const auto now = std::chrono::steady_clock::now();
         if (waiting_announcement_until != std::chrono::steady_clock::time_point::min() &&
             now > waiting_announcement_until) {
@@ -1107,7 +1021,6 @@ int main() {
             election_requested = true;
         }
 
-        // Eleição pedida por outro servidor, por falha do coordenador ou por não haver coordenador.
         const bool no_coordinator = get_coordinator().empty() &&
                                     waiting_announcement_until == std::chrono::steady_clock::time_point::min();
         if ((election_requested || no_coordinator) && now - last_election > std::chrono::seconds(3)) {

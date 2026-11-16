@@ -28,8 +28,6 @@ std::string get_timestamp() {
     return stream.str();
 }
 
-// Normaliza os timestamps dos servidores (ISO do Python/JS ou "data hora" do C++)
-// para "AAAA-MM-DD HH:MM:SS".
 std::string format_timestamp(const std::string& timestamp) {
     if (timestamp.size() >= 19 &&
         (timestamp[10] == 'T' || timestamp[10] == ' ')) {
@@ -49,12 +47,9 @@ std::string map_to_string(const std::map<std::string, std::string>& values) {
     return output + " }";
 }
 
-// Fila de canais que a thread principal pede para a thread do SUB assinar.
-// Sockets ZeroMQ não são thread-safe, então só a thread do SUB mexe no socket.
 std::mutex subscription_mutex;
 std::queue<std::string> pending_subscriptions;
 
-// As duas threads escrevem na tela; o mutex evita que as linhas se misturem.
 std::mutex output_mutex;
 
 void log_output(std::ostream& stream, const std::string& text) {
@@ -62,17 +57,14 @@ void log_output(std::ostream& stream, const std::string& text) {
     stream << text << std::endl;
 }
 
-// Relógio lógico (Lamport). As duas threads mexem nele, então fica protegido por mutex.
 std::mutex clock_mutex;
 long long logical_clock = 0;
 
-// Incrementa o relógio lógico antes de enviar uma mensagem.
 long long tick() {
     std::lock_guard<std::mutex> lock(clock_mutex);
     return ++logical_clock;
 }
 
-// Ao receber, fica com o maior valor entre o local e o recebido.
 long long update_clock(const std::map<std::string, std::string>& message) {
     std::lock_guard<std::mutex> lock(clock_mutex);
     const auto clock = message.find("logical_clock");
@@ -85,8 +77,6 @@ long long update_clock(const std::map<std::string, std::string>& message) {
     return logical_clock;
 }
 
-// As mensagens podem trazer valores de outros tipos além de texto (por exemplo,
-// logical_clock é um número), então cada valor é convertido para texto.
 std::string value_to_string(const msgpack::object& value) {
     switch (value.type) {
         case msgpack::type::STR:
@@ -120,7 +110,6 @@ std::map<std::string, std::string> decode_message(const char* data, std::size_t 
     return fields;
 }
 
-// Empacota os campos de texto e o logical_clock como número inteiro.
 msgpack::sbuffer encode_message(std::map<std::string, std::string> fields, long long clock) {
     fields.erase("logical_clock");
     msgpack::sbuffer buffer;
@@ -218,7 +207,6 @@ void subscriber_loop(const std::string& endpoint) {
             }
         }
 
-        // Timeout curto para conseguir aplicar novas inscrições da fila.
         zmq::pollitem_t items[] = {{subscriber.handle(), 0, ZMQ_POLLIN, 0}};
         zmq::poll(items, 1, std::chrono::milliseconds(200));
         if (!(items[0].revents & ZMQ_POLLIN)) {
@@ -238,7 +226,6 @@ void subscriber_loop(const std::string& endpoint) {
 
         const std::string channel(
             static_cast<const char*>(topic_frame.data()), topic_frame.size());
-        // O filtro do ZeroMQ é por prefixo ("canal-a" também casa com "canal-ab").
         if (subscribed_channels.find(channel) == subscribed_channels.end()) {
             continue;
         }
@@ -299,7 +286,6 @@ int main() {
         std::cout << "[Cliente C++] Conectando a " << endpoint
                   << " como " << username << std::endl;
 
-        // Em caso de erro, o login é repetido (requisito da parte 1).
         while (true) {
             const auto login = send_request(
                 request_socket, {{"action", "login"}, {"username", username}});
@@ -319,7 +305,6 @@ int main() {
         const std::string alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
 
         while (true) {
-            // 1. Se existirem menos do que 5 canais, cria um novo.
             auto channels = list_channels(request_socket);
             if (channels.size() < 5) {
                 const std::string new_channel =
@@ -343,7 +328,6 @@ int main() {
                 continue;
             }
 
-            // 2. Se estiver inscrito em menos do que 3 canais, inscreve-se em mais um.
             if (subscriptions.size() < 3) {
                 std::vector<std::string> candidates;
                 for (const auto& channel : channels) {
@@ -361,7 +345,6 @@ int main() {
                 }
             }
 
-            // 3. Escolhe um canal e envia 10 mensagens com 1 segundo de intervalo.
             std::uniform_int_distribution<std::size_t> channel_choice(0, channels.size() - 1);
             const std::string channel = channels[channel_choice(generator)];
             for (int index = 0; index < 10; ++index) {

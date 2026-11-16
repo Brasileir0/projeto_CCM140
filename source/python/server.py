@@ -44,6 +44,10 @@ replication_log: list[dict] = []
 last_seq: dict[str, int] = {}
 sync_cursor = 0
 
+applied_ids: set[str] = set()
+stored_users: set[str] = set()
+stored_publications: set[tuple[str, str, str, str, str]] = set()
+
 def get_now() -> datetime:
     return datetime.now(timezone.utc) + clock_offset
 
@@ -65,6 +69,8 @@ def dict_to_string(values: dict) -> str:
     def show(value: object) -> object:
         if isinstance(value, list) and len(value) > 5:
             return f"[{len(value)} itens]"
+        if isinstance(value, str) and "\n" in value:
+            return f"[{len([line for line in value.splitlines() if line.strip()])} linhas]"
         return value
     return "{ " + " | ".join(f"{key}: {show(values[key])}" for key in sorted(values)) + " }"
 
@@ -303,8 +309,15 @@ def handle_peer_request(raw_request: bytes, peer_socket: zmq.Socket) -> bool:
             except (TypeError, ValueError):
                 sender_rank = None
             start_election = my_rank is not None and sender_rank is not None and sender_rank < my_rank
+        elif action == "sync" and not isinstance(request.get("known"), dict):
+            response = {
+                "status": "success",
+                "users": "\n".join(sorted(stored_users)),
+                "channels": "\n".join(sorted(load_channels())),
+                "messages": "\n".join("|".join(key) for key in sorted(stored_publications)),
+            }
         elif action == "sync":
-            known = request.get("known") if isinstance(request.get("known"), dict) else {}
+            known = request["known"]
             missing = [
                 record for record in replication_log
                 if record["seq"] > to_int(known.get(record["origin"]), 0)
@@ -350,15 +363,89 @@ def is_text(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def is_valid_record(record: object) -> bool:
-    if not isinstance(record, dict) or not is_text(record.get("origin")):
+def publication_key(
+    channel: object, username: object, message: object, request_timestamp: object, publication_timestamp: object
+) -> tuple[str, str, str, str, str]:
+    return tuple(str(value or "") for value in (channel, username, message, request_timestamp, publication_timestamp))
+
+
+def load_stored_data() -> None:
+    if USERS_FILE.exists():
+        stored_users.update(line.strip() for line in USERS_FILE.read_text(encoding="utf-8").splitlines() if line.strip())
+    if EVENTS_FILE.exists():
+        for line in EVENTS_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and event.get("type") == "publication":
+                stored_publications.add(publication_key(
+                    event.get("channel"), event.get("username"), event.get("message"),
+                    event.get("request_timestamp"), event.get("timestamp"),
+                ))
+
+
+def save_user(username: str, login_timestamp: str) -> bool:
+    line = f"{username},{login_timestamp}"
+    if line in stored_users:
         return False
+    with USERS_FILE.open("a", encoding="utf-8") as users:
+        users.write(line + "\n")
+    stored_users.add(line)
+    return True
+
+
+def save_channel(channel: str) -> bool:
+    if channel in load_channels():
+        return False
+    with CHANNELS_FILE.open("a", encoding="utf-8") as channel_file:
+        channel_file.write(f"{channel}\n")
+    return True
+
+
+def save_publication(
+    channel: str, username: object, message: str, request_timestamp: object,
+    publication_timestamp: str, extra: dict,
+) -> bool:
+    key = publication_key(channel, username, message, request_timestamp, publication_timestamp)
+    if key in stored_publications:
+        return False
+    event = {"type": "publication", "channel": channel, "message": message, "timestamp": publication_timestamp}
+    event.update(extra)
+    if is_text(username):
+        event["username"] = username
+    if isinstance(request_timestamp, str):
+        event["request_timestamp"] = request_timestamp
+    persist_event(event)
+    stored_publications.add(key)
+    return True
+
+
+def has_valid_seq(record: dict) -> bool:
     seq = record.get("seq")
-    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
-        return False
+    return isinstance(seq, int) and not isinstance(seq, bool) and seq >= 1
+
+
+def login_time(record: dict) -> str:
+    value = record.get("request_timestamp")
+    return value if isinstance(value, str) else str(record.get("login_timestamp", ""))
+
+
+def is_valid_record(record: object) -> bool:
+    return (
+        isinstance(record, dict)
+        and is_text(record.get("origin"))
+        and has_valid_seq(record)
+        and is_valid_content(record)
+    )
+
+
+def is_valid_content(record: dict) -> bool:
     kind = record.get("type")
     if kind == "login":
-        return is_text(record.get("username")) and isinstance(record.get("request_timestamp"), str)
+        return is_text(record.get("username")) and (
+            isinstance(record.get("request_timestamp"), str) or isinstance(record.get("login_timestamp"), str)
+        )
     if kind == "channel":
         return is_text(record.get("channel"))
     if kind == "publication":
@@ -369,26 +456,22 @@ def is_valid_record(record: object) -> bool:
         )
     return False
 
-def apply_record(record: dict) -> None:
+def apply_record(record: dict) -> bool:
     if record["type"] == "login":
-        with USERS_FILE.open("a", encoding="utf-8") as users:
-            users.write(f"{record['username']},{record['request_timestamp']}\n")
-    elif record["type"] == "channel":
-        if record["channel"] not in load_channels():
-            with CHANNELS_FILE.open("a", encoding="utf-8") as channel_file:
-                channel_file.write(f"{record['channel']}\n")
-    elif record["type"] == "publication":
-        event = {
-            "type": "publication",
-            "channel": record["channel"],
-            "message": record["message"],
-            "timestamp": record["publication_timestamp"],
-        }
-        for key in ("publication_clock", "username", "request_timestamp"):
-            if key in record:
-                event["logical_clock" if key == "publication_clock" else key] = record[key]
-        event["origin"] = record["origin"]
-        persist_event(event)
+        return save_user(record["username"], login_time(record))
+    if record["type"] == "channel":
+        return save_channel(record["channel"])
+    if record["type"] == "publication":
+        save_channel(record["channel"])
+        extra = {}
+        if "publication_clock" in record:
+            extra["logical_clock"] = record["publication_clock"]
+        extra["origin"] = record["origin"]
+        return save_publication(
+            record["channel"], record.get("username"), record["message"],
+            record.get("request_timestamp"), record["publication_timestamp"], extra,
+        )
+    return False
 
 def store_record(record: dict) -> None:
     with REPLICATION_FILE.open("a", encoding="utf-8") as log_file:
@@ -408,7 +491,27 @@ def commit_record(data: dict, publisher: zmq.Socket) -> None:
     ])
     print(f"[{record['timestamp']}][REPL-PUB] {record['type']} {record['origin']}#{record['seq']}", flush=True)
 
+def accept_id_record(record: dict) -> str:
+    record_id = record.get("id")
+    if not is_text(record_id):
+        return "invalid"
+    if record_id in applied_ids:
+        return "duplicate"
+    applied_ids.add(record_id)
+    observe_logical_clock(record.get("logical_clock"))
+    stored = apply_record(record)
+    print(
+        f"[{get_timestamp()}][REPL] Aplicado {record['type']} de {record['origin']} "
+        f"({record_id}, {'gravado' if stored else 'já existia'})",
+        flush=True,
+    )
+    return "applied"
+
 def accept_record(record: object) -> str:
+    if not isinstance(record, dict) or not is_text(record.get("origin")) or not is_valid_content(record):
+        return "invalid"
+    if "seq" not in record:
+        return accept_id_record(record)
     if not is_valid_record(record):
         return "invalid"
     last = last_seq.get(record["origin"], 0)
@@ -428,6 +531,8 @@ def pull_from(context: zmq.Context, peer_name: str) -> int:
         if result is None or result[0].get("status") != "success":
             break
         response = result[0]
+        if not isinstance(response.get("records"), list) and isinstance(response.get("messages"), str):
+            return total + merge_lines(response, peer_name)
         applied = 0
         if isinstance(response.get("records"), list):
             for record in response["records"]:
@@ -437,6 +542,37 @@ def pull_from(context: zmq.Context, peer_name: str) -> int:
         if applied == 0 or str(response.get("more")).lower() != "true":
             break
     return total
+
+def merge_lines(response: dict, peer_name: str) -> int:
+    def lines(key: str) -> list[str]:
+        value = response.get(key)
+        return [line.strip() for line in value.splitlines() if line.strip()] if isinstance(value, str) else []
+
+    users = channels = messages = 0
+    for line in lines("users"):
+        username, _, login_timestamp = line.partition(",")
+        if username and save_user(username, login_timestamp):
+            users += 1
+    for channel in lines("channels"):
+        if save_channel(channel):
+            channels += 1
+    for line in lines("messages"):
+        parts = line.split("|")
+        if len(parts) < 5:
+            continue
+        channel, username = parts[0], parts[1]
+        message = "|".join(parts[2:-2])
+        if save_channel(channel):
+            channels += 1
+        if save_publication(channel, username, message, parts[-2], parts[-1], {"origin": peer_name}):
+            messages += 1
+    if users or channels or messages:
+        print(
+            f"[{get_timestamp()}][REPL] Dados de {peer_name}: {users} login(s), "
+            f"{channels} canal(is) e {messages} mensagem(ns) novos",
+            flush=True,
+        )
+    return users + channels + messages
 
 def other_servers(context: zmq.Context) -> list[str]:
     return sorted(name for name, _ in fetch_servers(context) if name != SERVER_NAME)
@@ -494,7 +630,10 @@ def handle_request(request: dict[str, object], publisher: zmq.Socket) -> dict[st
 
         username = username.strip()
 
-        commit_record({"type": "login", "username": username, "request_timestamp": timestamp}, publisher)
+        commit_record(
+            {"type": "login", "username": username, "request_timestamp": timestamp, "login_timestamp": timestamp},
+            publisher,
+        )
 
         print(f"[{timestamp}][LOGIN] Usuário: {username}", flush=True)
         return {"status": "success", "message": "Login realizado com sucesso"}
@@ -620,6 +759,7 @@ def handle_client_message(raw_request: bytes, socket: zmq.Socket, publisher: zmq
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     load_replication_log()
+    load_stored_data()
     context = zmq.Context()
     socket = context.socket(zmq.REP)
     broker_backend = os.environ.get("BROKER_BACKEND")
