@@ -245,30 +245,149 @@ void send_message(zmq::socket_t& socket, const std::map<std::string, std::string
     socket.send(message, zmq::send_flags::none);
 }
 
-void save_user(const std::string& username, const std::string& timestamp) {
-    std::ofstream file("data/users.txt", std::ios::app);
-    file << username << "," << timestamp << "\n";
+// ---------------------------------------------------------------------------
+// Persistência
+// ---------------------------------------------------------------------------
+// Com a replicação, o mesmo dado pode chegar mais de uma vez (pelo tópico
+// "replication" e pela sincronização inicial), então cada arquivo só recebe
+// linhas que ainda não tem. A thread que atende os outros servidores também lê
+// esses arquivos, por isso o acesso é protegido por mutex.
+const char* USERS_FILE = "data/users.txt";
+const char* CHANNELS_FILE = "data/channels.txt";
+const char* MESSAGES_FILE = "data/messages.txt";
+std::mutex data_mutex;
+std::map<std::string, std::set<std::string>> stored_lines;  // arquivo -> linhas já gravadas
+
+std::vector<std::string> read_lines(const std::string& path) {
+    std::vector<std::string> lines;
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty()) lines.push_back(line);
+    }
+    return lines;
 }
 
-void save_channel(const std::string& channel) {
-    std::ofstream file("data/channels.txt", std::ios::app);
-    file << channel << "\n";
+void load_stored_lines() {
+    std::lock_guard<std::mutex> lock(data_mutex);
+    for (const char* path : {USERS_FILE, CHANNELS_FILE, MESSAGES_FILE}) {
+        for (const auto& line : read_lines(path)) {
+            stored_lines[path].insert(line);
+        }
+    }
 }
 
-void save_message(const std::string& channel, const std::string& username, const std::string& message,
+// Grava a linha no arquivo se ela ainda não existir. Devolve true se gravou.
+bool append_line(const char* path, const std::string& line) {
+    std::lock_guard<std::mutex> lock(data_mutex);
+    if (!stored_lines[path].insert(line).second) {
+        return false;
+    }
+    std::ofstream file(path, std::ios::app);
+    file << line << "\n";
+    return true;
+}
+
+std::string user_line(const std::string& username, const std::string& timestamp) {
+    return username + "," + timestamp;
+}
+
+std::string message_line(const std::string& channel, const std::string& username, const std::string& message,
+                         const std::string& request_timestamp, const std::string& timestamp) {
+    return channel + "|" + username + "|" + message + "|" + request_timestamp + "|" + timestamp;
+}
+
+bool save_user(const std::string& username, const std::string& timestamp) {
+    return append_line(USERS_FILE, user_line(username, timestamp));
+}
+
+bool save_channel(const std::string& channel) {
+    return append_line(CHANNELS_FILE, channel);
+}
+
+bool save_message(const std::string& channel, const std::string& username, const std::string& message,
                   const std::string& request_timestamp, const std::string& timestamp) {
-    std::ofstream file("data/messages.txt", std::ios::app);
-    file << channel << "|" << username << "|" << message << "|" << request_timestamp << "|" << timestamp << "\n";
+    return append_line(MESSAGES_FILE, message_line(channel, username, message, request_timestamp, timestamp));
 }
 
 std::set<std::string> load_channels() {
-    std::set<std::string> channels;
-    std::ifstream file("data/channels.txt");
-    std::string line;
-    while (std::getline(file, line)) {
-        if (!line.empty()) channels.insert(line);
+    std::lock_guard<std::mutex> lock(data_mutex);
+    return stored_lines[CHANNELS_FILE];
+}
+
+// Todas as linhas de um arquivo, separadas por quebra de linha (usado na sincronização inicial).
+std::string dump_lines(const char* path) {
+    std::lock_guard<std::mutex> lock(data_mutex);
+    std::string output;
+    for (const auto& line : stored_lines[path]) {
+        output += line + "\n";
     }
-    return channels;
+    return output;
+}
+
+// Grava as linhas recebidas (separadas por quebra de linha) e devolve quantas eram novas.
+int merge_lines(const char* path, const std::string& lines) {
+    int added = 0;
+    std::stringstream stream(lines);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && append_line(path, line)) added++;
+    }
+    return added;
+}
+
+// ---------------------------------------------------------------------------
+// Replicação (parte 5)
+// ---------------------------------------------------------------------------
+// Replicação ativa pelo Pub/Sub: toda gravação feita a partir de um cliente
+// (login, criação de canal ou publicação) é publicada no tópico "replication".
+// Todos os servidores assinam o tópico e gravam o mesmo dado no próprio disco,
+// então todos acabam com todos os dados.
+const std::string REPLICATION_TOPIC = "replication";
+std::string replication_prefix;  // nome do servidor + horário de início (ids não se repetem após reiniciar)
+long long replication_sequence = 0;
+std::set<std::string> applied_replications;  // ids já aplicados (só a thread principal usa)
+
+void publish_replication(zmq::socket_t& pub_socket, std::map<std::string, std::string> fields) {
+    fields["origin"] = server_name;
+    fields["id"] = replication_prefix + ":" + std::to_string(++replication_sequence);
+    fields["timestamp"] = get_timestamp();
+    const long long clock = tick();
+    msgpack::sbuffer buffer = encode_message(fields, clock);
+    zmq::message_t topic_msg(REPLICATION_TOPIC.data(), REPLICATION_TOPIC.size());
+    zmq::message_t content_msg(buffer.data(), buffer.size());
+    pub_socket.send(topic_msg, zmq::send_flags::sndmore);
+    pub_socket.send(content_msg, zmq::send_flags::none);
+    log_line("[", fields["timestamp"], "][REPLICAÇÃO] Enviado: ", map_to_string(fields), " | logical_clock: ", clock);
+}
+
+void apply_replication(const std::map<std::string, std::string>& fields) {
+    auto get = [&](const std::string& key) {
+        const auto it = fields.find(key);
+        return it == fields.end() ? std::string() : it->second;
+    };
+    const std::string origin = get("origin");
+    const std::string id = get("id");
+    // O próprio servidor também recebe o que publicou; isso já está gravado.
+    if (origin == server_name) return;
+    if (!id.empty() && !applied_replications.insert(id).second) return;
+
+    const std::string type = get("type");
+    bool stored = false;
+    if (type == "login") {
+        stored = save_user(get("username"), get("login_timestamp"));
+    } else if (type == "channel") {
+        stored = save_channel(get("channel"));
+    } else if (type == "publication") {
+        save_channel(get("channel"));
+        stored = save_message(get("channel"), get("username"), get("message"),
+                              get("request_timestamp"), get("publication_timestamp"));
+    } else {
+        log_error("[", get_timestamp(), "][REPLICAÇÃO] Tipo desconhecido de ", origin, ": ", type);
+        return;
+    }
+    log_line("[", get_timestamp(), "][REPLICAÇÃO] Recebido de ", origin, " (", type, ", ",
+             stored ? "gravado" : "já existia", "): ", map_to_string(fields));
 }
 
 // "nome:rank;nome:rank" -> lista de (nome, rank).
@@ -471,6 +590,13 @@ void peer_loop(zmq::context_t& context) {
                     reply["timestamp"] = iso_timestamp(correct_time);
                     reply["coordinator"] = server_name;
                 }
+            } else if (action == "sync") {
+                // Sincronização inicial (parte 5): devolve todos os dados deste servidor.
+                reply["status"] = "success";
+                reply["users"] = dump_lines(USERS_FILE);
+                reply["channels"] = dump_lines(CHANNELS_FILE);
+                reply["messages"] = dump_lines(MESSAGES_FILE);
+                log_line("[", get_timestamp(), "][REPLICAÇÃO] Enviando todos os dados para ", fields["name"]);
             } else {
                 reply["status"] = "error";
                 reply["message"] = "Ação desconhecida";
@@ -656,6 +782,52 @@ void synchronize_with_coordinator(zmq::context_t& context) {
     }
 }
 
+// Sincronização inicial (parte 5): ao subir, o servidor pede todos os dados a outro
+// servidor disponível, para recuperar o que foi gravado enquanto ele estava fora.
+// Tenta os servidores da lista da referência até um responder.
+void initial_sync(zmq::context_t& context) {
+    request_server_list(context);
+    for (const auto& [name, rank] : known_servers) {
+        if (name == server_name) continue;
+
+        zmq::socket_t socket(context, zmq::socket_type::req);
+        socket.set(zmq::sockopt::linger, 0);
+        socket.set(zmq::sockopt::rcvtimeo, 2000);
+        try {
+            socket.connect(peer_endpoint(name));
+        } catch (const zmq::error_t&) {
+            continue;
+        }
+        std::map<std::string, std::string> request = {
+            {"action", "sync"}, {"name", server_name}, {"rank", std::to_string(my_rank)},
+            {"timestamp", get_timestamp()}};
+        const long long clock = tick();
+        log_line("[", request["timestamp"], "][REQ SERVIDOR] para ", name, ": ", map_to_string(request),
+                 " | logical_clock: ", clock);
+        send_message(socket, request, clock);
+
+        zmq::message_t reply;
+        if (!socket.recv(reply, zmq::recv_flags::none)) {
+            log_line("[", get_timestamp(), "][REPLICAÇÃO] ", name, " não respondeu à sincronização");
+            continue;
+        }
+        try {
+            auto fields = decode_message(static_cast<const char*>(reply.data()), reply.size());
+            update_clock(fields);
+            if (fields["status"] != "success") continue;
+            const int users = merge_lines(USERS_FILE, fields["users"]);
+            const int channels = merge_lines(CHANNELS_FILE, fields["channels"]);
+            const int messages = merge_lines(MESSAGES_FILE, fields["messages"]);
+            log_line("[", get_timestamp(), "][REPLICAÇÃO] Sincronização inicial com ", name, ": ", users,
+                     " login(s), ", channels, " canal(is) e ", messages, " mensagem(ns) novos");
+            return;
+        } catch (const std::exception& error) {
+            log_error("[", get_timestamp(), "][REPLICAÇÃO] Resposta inválida de ", name, ": ", error.what());
+        }
+    }
+    log_line("[", get_timestamp(), "][REPLICAÇÃO] Nenhum servidor respondeu à sincronização; seguindo com os dados locais");
+}
+
 // ---------------------------------------------------------------------------
 // Requisições dos clientes
 // ---------------------------------------------------------------------------
@@ -682,6 +854,8 @@ std::map<std::string, std::string> handle_request(std::map<std::string, std::str
             log_line("[", request_timestamp, "][LOGIN] Usuário: ", username);
             rep_map["status"] = "success";
             rep_map["message"] = "Login realizado com sucesso";
+            publish_replication(pub_socket, {{"type", "login"}, {"username", username},
+                                             {"login_timestamp", request_timestamp}});
         }
     }
     else if (action == "create_channel") {
@@ -696,6 +870,7 @@ std::map<std::string, std::string> handle_request(std::map<std::string, std::str
             log_line("[", request_timestamp, "][CHANNEL] Canal criado: ", channel);
             rep_map["status"] = "success";
             rep_map["message"] = "Canal criado com sucesso";
+            publish_replication(pub_socket, {{"type", "channel"}, {"channel", channel}});
         } else {
             rep_map["status"] = "error";
             rep_map["message"] = "Canal já existe";
@@ -750,6 +925,10 @@ std::map<std::string, std::string> handle_request(std::map<std::string, std::str
             rep_map["status"] = "success";
             rep_map["message"] = "Mensagem publicada com sucesso";
             log_line("[", publication_timestamp, "][PUB] ", map_to_string(publication), " | logical_clock: ", clock);
+            publish_replication(pub_socket, {{"type", "publication"}, {"channel", channel},
+                                             {"username", username}, {"message", message},
+                                             {"request_timestamp", request_timestamp},
+                                             {"publication_timestamp", publication_timestamp}});
         }
     }
     else {
@@ -782,6 +961,7 @@ void handle_announcement(const std::map<std::string, std::string>& fields) {
 
 int main() {
     std::filesystem::create_directories("data");
+    load_stored_lines();
 
     char hostname[256] = {};
     gethostname(hostname, sizeof(hostname) - 1);
@@ -821,7 +1001,10 @@ int main() {
     const char* pubsub_xpub = std::getenv("PUBSUB_XPUB_ENDPOINT");
     sub_socket.connect(pubsub_xpub ? pubsub_xpub : "tcp://proxy-pubsub:5558");
     sub_socket.set(zmq::sockopt::subscribe, "servers");
-    log_line("[Servidor C++] Publisher conectado ao proxy Pub/Sub e inscrito no tópico servers");
+    // E o tópico "replication", para receber os dados gravados pelos outros servidores.
+    sub_socket.set(zmq::sockopt::subscribe, REPLICATION_TOPIC);
+    replication_prefix = server_name + ":" + std::to_string(now_ms());
+    log_line("[Servidor C++] Publisher conectado ao proxy Pub/Sub e inscrito nos tópicos servers e replication");
     if (clock_offset_ms != 0) {
         log_line("[", get_timestamp(), "][RELÓGIO] Iniciando com atraso simulado de ", clock_offset_ms.load(), " ms");
     }
@@ -831,8 +1014,9 @@ int main() {
         connect_reference(context);
         request_rank(context);
         std::thread(peer_loop, std::ref(context)).detach();
-        // Dá tempo de a inscrição no tópico "servers" chegar ao proxy antes da eleição.
+        // Dá tempo de a inscrição nos tópicos chegar ao proxy antes da eleição e da sincronização.
         sleep(1);
+        initial_sync(context);
         election_requested = true;
     }
 
@@ -858,6 +1042,14 @@ int main() {
                         waiting_announcement_until = std::chrono::steady_clock::time_point::min();
                     } catch (const std::exception& error) {
                         log_error("[", get_timestamp(), "][ERRO] Anúncio inválido: ", error.what());
+                    }
+                } else if (topic == REPLICATION_TOPIC) {
+                    try {
+                        auto fields = decode_message(static_cast<const char*>(content_frame.data()), content_frame.size());
+                        update_clock(fields);
+                        apply_replication(fields);
+                    } catch (const std::exception& error) {
+                        log_error("[", get_timestamp(), "][ERRO] Replicação inválida: ", error.what());
                     }
                 }
             }
