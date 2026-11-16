@@ -375,7 +375,10 @@ void apply_replication(const std::map<std::string, std::string>& fields) {
     const std::string type = get("type");
     bool stored = false;
     if (type == "login") {
-        stored = save_user(get("username"), get("login_timestamp"));
+        // O Python manda a hora do login em request_timestamp.
+        const std::string login_timestamp =
+            get("login_timestamp").empty() ? get("request_timestamp") : get("login_timestamp");
+        stored = save_user(get("username"), login_timestamp);
     } else if (type == "channel") {
         stored = save_channel(get("channel"));
     } else if (type == "publication") {
