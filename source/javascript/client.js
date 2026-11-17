@@ -1,0 +1,186 @@
+const zmq = require('zeromq');
+const msgpack = require('msgpack5')();
+let logicalClock = 0;
+
+function getTimestamp() {
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+}
+
+function formatTimestamp(timestamp) {
+    if (typeof timestamp !== 'string') {
+        return 'desconhecido';
+    }
+    const match = timestamp.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+    return match ? `${match[1]} ${match[2]}` : timestamp;
+}
+
+function objectToString(values) {
+    return `{ ${Object.keys(values).sort().map((key) => `${key}: ${values[key]}`).join(' | ')} }`;
+}
+
+function delay(milliseconds) {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function chooseRandom(items) {
+    return items[Math.floor(Math.random() * items.length)];
+}
+
+function normalizeChannels(channels) {
+    if (Array.isArray(channels)) {
+        return channels.filter((channel) => typeof channel === 'string' && channel.length > 0);
+    }
+    if (typeof channels === 'string') {
+        return channels.split(';').map((channel) => channel.trim()).filter(Boolean);
+    }
+    throw new Error('A resposta do servidor não contém uma lista de canais válida.');
+}
+
+async function sendRequest(socket, requestData) {
+    logicalClock += 1;
+    const request = { ...requestData, timestamp: getTimestamp(), logical_clock: logicalClock };
+    console.log(`[${request.timestamp}][REQ] ${objectToString(request)}`);
+    await socket.send(msgpack.encode(request));
+    const [replyBuffer] = await socket.receive();
+    const response = msgpack.decode(replyBuffer);
+    if (Number.isSafeInteger(response.logical_clock) && response.logical_clock >= 0) {
+        logicalClock = Math.max(logicalClock, response.logical_clock);
+    }
+    console.log(`[${formatTimestamp(response.timestamp)}][REP] ${objectToString(response)}`);
+    return response;
+}
+
+async function listChannels(socket) {
+    const response = await sendRequest(socket, { action: 'list_channels' });
+    if (response.status !== 'success') {
+        throw new Error(`Não foi possível listar canais: ${response.message}`);
+    }
+    return normalizeChannels(response.channels);
+}
+
+async function receivePublications(socket, subscribedChannels) {
+    for await (const frames of socket) {
+        if (frames.length < 2) {
+            console.error('[SUB][ERRO] Formato de publicação inválido');
+            continue;
+        }
+
+        const channel = frames[0].toString();
+
+        if (!subscribedChannels.has(channel)) {
+            continue;
+        }
+
+        try {
+            const publication = msgpack.decode(frames[1]);
+            if (Number.isSafeInteger(publication.logical_clock) && publication.logical_clock >= 0) {
+                logicalClock = Math.max(logicalClock, publication.logical_clock);
+            }
+            console.log(
+                `\n---------- NOVA MENSAGEM ---------\n` +
+                `Canal: ${channel}\n` +
+                (publication.username ? `Autor: ${publication.username}\n` : '') +
+                `Mensagem: ${publication.message}\n` +
+                `Enviada em: ${formatTimestamp(publication.timestamp)}\n` +
+                `Relógio lógico: ${publication.logical_clock ?? 'indisponível'}\n` +
+                `Recebida em: ${getTimestamp()}\n` +
+                `Relógio lógico local: ${logicalClock}\n` +
+                `------------------------------------\n`
+            );
+        } catch (error) {
+            console.error(`[SUB][ERRO] Publicação inválida no canal ${channel}:`, error);
+        }
+    }
+}
+
+async function main() {
+    const endpoints = (process.env.SERVER_ENDPOINTS || 'tcp://server-javascript-1:5555')
+        .split(',')
+        .map((endpoint) => endpoint.trim())
+        .filter(Boolean);
+    if (endpoints.length === 0) {
+        throw new Error('SERVER_ENDPOINTS não contém endpoints válidos.');
+    }
+
+    const endpoint = chooseRandom(endpoints);
+    const username = process.env.BOT_NAME || `JAVASCRIPT-${process.pid}`;
+    const requestSocket = new zmq.Request();
+    const subscriber = new zmq.Subscriber();
+    const subscribedChannels = new Set();
+    requestSocket.connect(endpoint);
+    subscriber.connect(process.env.PUBSUB_XPUB_ENDPOINT || 'tcp://proxy-pubsub:5558');
+    const receiver = receivePublications(subscriber, subscribedChannels).catch((error) => {
+        if (error.code !== 'ETERM') {
+            console.error('[Cliente JS] Erro no recebimento Pub/Sub:', error);
+            process.exitCode = 1;
+        }
+    });
+
+    try {
+        console.log(`[Cliente JS] Conectado a ${endpoint} como ${username}`);
+
+        while (true) {
+            const login = await sendRequest(requestSocket, { action: 'login', username });
+            if (login.status === 'success') {
+                break;
+            }
+            console.error(`[Cliente JS] Login falhou: ${login.message}. Tentando novamente...`);
+            await delay(1000);
+        }
+
+        while (true) {
+            let channels = await listChannels(requestSocket);
+            if (channels.length < 5) {
+                const newChannel = `canal-${username}-${Date.now()}`;
+                const created = await sendRequest(requestSocket, { action: 'create_channel', channel: newChannel });
+                if (created.status === 'success') {
+                    channels = await listChannels(requestSocket);
+                } else {
+                    console.error(`[Cliente JS] Não foi possível criar o canal ${newChannel}: ${created.message}`);
+                }
+            }
+            if (channels.length === 0) {
+                console.error('[Cliente JS] Nenhum canal disponível, tentando novamente...');
+                await delay(1000);
+                continue;
+            }
+
+            if (subscribedChannels.size < 3) {
+                const candidates = channels.filter((channel) => !subscribedChannels.has(channel));
+                if (candidates.length > 0) {
+                    const channel = chooseRandom(candidates);
+                    subscribedChannels.add(channel);
+                    subscriber.subscribe(channel);
+                    console.log(`[${getTimestamp()}][SUB] Inscrito no canal: ${channel}`);
+                }
+            }
+
+            const channel = chooseRandom(channels);
+            for (let index = 0; index < 10; index += 1) {
+                const message = `Mensagem ${index + 1} de ${username}: ${Math.random().toString(36).slice(2, 10)}`;
+                const response = await sendRequest(requestSocket, {
+                    action: 'publish',
+                    channel,
+                    message,
+                    username
+                });
+                if (response.status !== 'success') {
+                    console.error(`[ERRO PUBLICAÇÃO] ${response.message}`);
+                }
+                await delay(1000);
+            }
+        }
+    } finally {
+        subscriber.close();
+        requestSocket.close();
+        await receiver;
+    }
+}
+
+main().catch((error) => {
+    console.error('[Cliente JS] Falha:', error);
+    process.exitCode = 1;
+});

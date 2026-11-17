@@ -1,0 +1,17 @@
+{
+  "name": "zmq-js-client",
+  "version": "1.0.0",
+  "description": "Servidor e Cliente ZeroMQ com MessagePack em JavaScript",
+  "main": "server.js",
+  "scripts": {
+    "start:client": "node client.js",
+    "start:server": "node server.js",
+    "start:reference": "node reference.js",
+    "start:broker": "node broker.js",
+    "start:proxy-pubsub": "node proxy_pubsub.js"
+  },
+  "dependencies": {
+    "msgpack5": "^6.0.2",
+    "zeromq": "^6.0.0"
+  }
+}
